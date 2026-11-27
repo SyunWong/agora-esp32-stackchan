@@ -1,0 +1,4078 @@
+diff --git a/.gitignore b/.gitignore
+index 070b9a7..ca88c19 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -36,3 +36,8 @@ coverage.info
+ coverage_report/
+ 
+ .vscode
++
++*session_local.h
++
++__pycache__/
++*.pyc
+diff --git a/components/av_render/render_impl/i2s_render.c b/components/av_render/render_impl/i2s_render.c
+index 09edebd..5dd9dca 100644
+--- a/components/av_render/render_impl/i2s_render.c
++++ b/components/av_render/render_impl/i2s_render.c
+@@ -123,7 +123,7 @@ static int i2s_render_write(audio_render_handle_t render, av_render_audio_frame_
+             in_samples.samples = audio_data->data + in_samples.consume_num * SAMPLE_SIZE(i2s->info);
+         }
+     } else {
+-        int ret = esp_codec_dev_write(i2s->play_handle, audio_data->data, audio_data->size);
++        ret = esp_codec_dev_write(i2s->play_handle, audio_data->data, audio_data->size);
+         if (ret == 0 && i2s->ref_cb) {
+             i2s->ref_cb(audio_data->data, audio_data->size, i2s->ref_ctx);
+         }
+diff --git a/components/av_render/src/audio_decoder.c b/components/av_render/src/audio_decoder.c
+index e541c6b..91f0fc5 100644
+--- a/components/av_render/src/audio_decoder.c
++++ b/components/av_render/src/audio_decoder.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <inttypes.h>
++#include <math.h>
+ #include "audio_decoder.h"
+ #include "esp_audio_dec.h"
+ #include "esp_audio_dec_default.h"
+@@ -42,8 +43,48 @@ typedef struct {
+     void                        *ctx;
+     uint8_t                     *frame_data;
+     int                          frame_size;
++    uint64_t                     meter_energy;
++    uint32_t                     meter_samples;
++    uint32_t                     meter_frames;
++    uint32_t                     meter_blocks;
++    uint32_t                     meter_peak;
+ } adec_t;
+ 
++// Numeric diagnostics before resampling; no PCM is retained. Inspect every
++// eighth time sample, including all channels, to bound the extra CPU work.
++static void meter_decoded_frame(adec_t *adec, const av_render_audio_frame_t *frame)
++{
++    const av_render_audio_frame_info_t *info = &adec->frame_info;
++    if (!frame->data || !info->sample_rate || !info->channel ||
++        (info->bits_per_sample != 16 && info->bits_per_sample != 32)) {
++        return;
++    }
++    uint32_t count = frame->size / (info->channel * (info->bits_per_sample / 8));
++    for (uint32_t i = 0; i < count; i += 8) {
++        for (unsigned ch = 0; ch < info->channel; ++ch) {
++            uint32_t index = i * info->channel + ch;
++            int32_t value = info->bits_per_sample == 16
++                                ? ((const int16_t *)frame->data)[index]
++                                : ((const int32_t *)frame->data)[index] / 65536;
++            uint32_t magnitude = value < 0 ? -value : value;
++            if (magnitude > adec->meter_peak) adec->meter_peak = magnitude;
++            adec->meter_energy += (int64_t)value * value;
++            ++adec->meter_samples;
++        }
++    }
++    adec->meter_frames += count;
++    ++adec->meter_blocks;
++    if (adec->meter_frames >= info->sample_rate * 2 && adec->meter_samples) {
++        ESP_LOGI(TAG, "DECODED_PCM blocks=%" PRIu32 " rms16=%u sampled_peak16=%" PRIu32
++                 " sampled_values=%" PRIu32 " stride=8",
++                 adec->meter_blocks,
++                 (unsigned)sqrt((double)adec->meter_energy / adec->meter_samples),
++                 adec->meter_peak, adec->meter_samples);
++        adec->meter_energy = 0;
++        adec->meter_samples = adec->meter_frames = adec->meter_blocks = adec->meter_peak = 0;
++    }
++}
++
+ static esp_audio_type_t get_audio_decoder_type(av_render_audio_codec_t audio_format)
+ {
+     switch (audio_format) {
+@@ -208,16 +249,19 @@ RETRY:
+     if (adec->header_parsed == false && frame.decoded_size > 0) {
+         esp_audio_dec_info_t header = {};
+         esp_audio_dec_get_info(adec->dec_handle, &header);
+-        printf("Get samplerate %d chanel %d\n", (int)header.sample_rate, header.channel);
+         if (header.sample_rate && header.channel && header.bits_per_sample) {
+             adec->frame_info.sample_rate = header.sample_rate;
+             adec->frame_info.channel = header.channel;
+             adec->frame_info.bits_per_sample = header.bits_per_sample;
+         }
++        ESP_LOGI(TAG, "Decoded format: rate=%" PRIu32 " channels=%u bits=%u",
++                 adec->frame_info.sample_rate, adec->frame_info.channel,
++                 adec->frame_info.bits_per_sample);
+         adec->header_parsed = true;
+     }
+     frame_data->data = adec->frame_data;
+     frame_data->size = frame.decoded_size;
++    meter_decoded_frame(adec, frame_data);
+     if (adec->frame_cb) {
+         adec->frame_cb(frame_data, adec->ctx);
+     }
+diff --git a/components/av_render/src/audio_resample.c b/components/av_render/src/audio_resample.c
+index dde4bee..9a8cebd 100644
+--- a/components/av_render/src/audio_resample.c
++++ b/components/av_render/src/audio_resample.c
+@@ -184,6 +184,10 @@ audio_resample_handle_t audio_resample_open(audio_resample_cfg_t *cfg)
+             break;
+         }
+         resample->cfg = *cfg;
++        ESP_LOGI(TAG, "Format: input=%luHz/%uch/%ubit output=%luHz/%uch/%ubit",
++                 (unsigned long)cfg->input_info.sample_rate, cfg->input_info.channel,
++                 cfg->input_info.bits_per_sample, (unsigned long)cfg->output_info.sample_rate,
++                 cfg->output_info.channel, cfg->output_info.bits_per_sample);
+         return resample;
+     } while (0);
+     audio_resample_close(resample);
+@@ -215,18 +219,25 @@ int audio_resample_write(audio_resample_handle_t h, av_render_audio_frame_t *dat
+             return ESP_MEDIA_ERR_NO_MEM;
+         }
+         esp_ae_sample_t in_sample = (esp_ae_sample_t)(last ? last->data : data->data);
++        esp_ae_err_t ret = ESP_AE_ERR_OK;
+         if (resample->ops[i] == RESAMPLE_OPS_CH_CVT) {
+-            esp_ae_ch_cvt_process(resample->ch_cvt_handle, sample_num, in_sample, (esp_ae_sample_t)cur->data);
++            ret = esp_ae_ch_cvt_process(resample->ch_cvt_handle, sample_num, in_sample, (esp_ae_sample_t)cur->data);
+             cur_info.channel = resample->cfg.output_info.channel;
+         } else if (resample->ops[i] == RESAMPLE_OPS_RATE_CVT) {
+-            esp_ae_rate_cvt_process(resample->rate_cvt_handle, in_sample, sample_num, (esp_ae_sample_t)cur->data, &out_sample);
++            ret = esp_ae_rate_cvt_process(resample->rate_cvt_handle, in_sample, sample_num, (esp_ae_sample_t)cur->data, &out_sample);
+             need_size = out_sample * SAMPLE_SIZE(cur_info);
+             cur_info.sample_rate = resample->cfg.output_info.sample_rate;
+             sample_num = out_sample;
+         } else if (resample->ops[i] == RESAMPLE_OPS_BIT_CVT) {
+-            esp_ae_bit_cvt_process(resample->bit_cvt_handle, sample_num, in_sample, (esp_ae_sample_t)cur->data);
++            ret = esp_ae_bit_cvt_process(resample->bit_cvt_handle, sample_num, in_sample, (esp_ae_sample_t)cur->data);
+             cur_info.bits_per_sample = resample->cfg.output_info.bits_per_sample;
+         }
++        if (ret != ESP_AE_ERR_OK) {
++            ESP_LOGE(TAG, "Conversion failed: op=%d ret=%d", resample->ops[i], ret);
++            release_work_buf(cur);
++            release_work_buf(last);
++            return ESP_MEDIA_ERR_FAIL;
++        }
+         if (last) {
+             release_work_buf(last);
+         }
+diff --git a/components/esp_webrtc/include/esp_webrtc.h b/components/esp_webrtc/include/esp_webrtc.h
+index b037755..91cbd63 100644
+--- a/components/esp_webrtc/include/esp_webrtc.h
++++ b/components/esp_webrtc/include/esp_webrtc.h
+@@ -86,6 +86,20 @@ typedef struct {
+     int (*on_data)(esp_peer_data_frame_t *frame, void *ctx);               /*!< Callback invoked when data is received on the channel */
+     int (*on_channel_close)(esp_peer_data_channel_info_t *ch, void *ctx);  /*!< Callback invoked when a data channel is closed */
+ 
++    /**
++     * @brief  Optional gate checked immediately before each captured audio frame is sent.
++     *
++     * The callback runs in the media sender task and must not block or call
++     * lifecycle APIs. Return false to discard the frame. Discarded frames are
++     * still released to the capture provider and do not increment send counters.
++     * A NULL callback preserves normal sending. Frames already submitted to the
++     * peer cannot be recalled by changing the gate.
++     *
++     * @param[in]  frame  Read-only captured audio frame; valid only during the callback
++     * @param[in]  ctx    User-defined context from this peer configuration
++     */
++    bool (*on_audio_send)(const esp_peer_audio_frame_t *frame, void *ctx);
++
+     /**
+      * @brief  Callback hook for sending video frames (supports modification or SEI injection).
+      *
+diff --git a/components/esp_webrtc/src/esp_webrtc.c b/components/esp_webrtc/src/esp_webrtc.c
+index c6e285a..0377dbd 100644
+--- a/components/esp_webrtc/src/esp_webrtc.c
++++ b/components/esp_webrtc/src/esp_webrtc.c
+@@ -24,6 +24,7 @@
+ 
+ #include <stdio.h>
+ #include <stdint.h>
++#include <stdatomic.h>
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -80,7 +81,8 @@ typedef struct {
+     esp_peer_handle_t            pc;
+     esp_peer_signaling_handle_t  signaling;
+     esp_peer_state_t             peer_state;
+-    bool                         running;
++    atomic_bool                  running;
++    atomic_bool                  stopping;
+     bool                         pause;
+     media_lib_event_grp_handle_t wait_event;
+     esp_webrtc_event_handler_t   event_handler;
+@@ -89,7 +91,7 @@ typedef struct {
+     // These field will change to esp_media_stream in the near feature
+ 
+     esp_timer_handle_t            send_timer;
+-    bool                          send_going;
++    atomic_bool                   send_going;
+     esp_webrtc_media_provider_t   media_provider;
+     esp_capture_sink_handle_t     capture_path;
+     av_render_handle_t            play_handle;
+@@ -321,14 +323,21 @@ static void _media_send(void *ctx)
+                 .data = audio_frame.data,
+                 .size = audio_frame.size,
+             };
+-            esp_peer_send_audio(rtc->pc, &audio_send_frame);
+-            esp_capture_sink_release_frame(rtc->capture_path, &audio_frame);
+-            rtc->aud_send_pts = audio_frame.pts;
+-            rtc->aud_send_num++;
+-            rtc->aud_send_size += audio_frame.size;
+-            if (webrtc_tracing) {
+-                printf("A\n");
++            bool should_send = rtc->rtc_cfg.peer_cfg.on_audio_send == NULL ||
++                               rtc->rtc_cfg.peer_cfg.on_audio_send(&audio_send_frame,
++                                                                   rtc->rtc_cfg.peer_cfg.ctx);
++            if (should_send) {
++                esp_peer_send_audio(rtc->pc, &audio_send_frame);
++                rtc->aud_send_pts = audio_frame.pts;
++                rtc->aud_send_num++;
++                rtc->aud_send_size += audio_frame.size;
++                if (webrtc_tracing) {
++                    printf("A\n");
++                }
+             }
++            // Always drain/release capture frames, including when the UI has
++            // closed the uplink gate while its session worker is still busy.
++            esp_capture_sink_release_frame(rtc->capture_path, &audio_frame);
+         }
+     }
+     if (rtc->rtc_cfg.peer_cfg.video_info.codec) {
+@@ -381,9 +390,15 @@ void media_send_task(void *arg)
+ 
+ static int start_stream(webrtc_t *rtc)
+ {
++    if (rtc->stopping) {
++        return ESP_PEER_ERR_WRONG_STATE;
++    }
++    if (rtc->send_going) {
++        return ESP_CAPTURE_ERR_OK;
++    }
+     int ret = esp_capture_start(rtc->media_provider.capture);
+-    if (rtc->no_auto_capture) {
+-        esp_capture_sink_enable(rtc->capture_path, ESP_CAPTURE_RUN_MODE_ALWAYS);
++    if (ret == ESP_CAPTURE_ERR_OK && rtc->no_auto_capture) {
++        ret = esp_capture_sink_enable(rtc->capture_path, ESP_CAPTURE_RUN_MODE_ALWAYS);
+     }
+     if (ret == ESP_CAPTURE_ERR_OK) {
+         media_lib_thread_handle_t handle = NULL;
+@@ -395,6 +410,13 @@ static int start_stream(webrtc_t *rtc)
+     } else {
+         ESP_LOGE(TAG, "Fail to start capture ret:%d", ret);
+     }
++    if (ret != ESP_CAPTURE_ERR_OK) {
++        if (rtc->no_auto_capture) {
++            esp_capture_sink_enable(rtc->capture_path, ESP_CAPTURE_RUN_MODE_DISABLE);
++        } else {
++            esp_capture_stop(rtc->media_provider.capture);
++        }
++    }
+     return ret;
+ }
+ 
+@@ -428,6 +450,9 @@ esp_gmf_err_t esp_gmf_video_enc_set_gop(esp_gmf_element_handle_t handle, uint32_
+ static int pc_on_state(esp_peer_state_t state, void *ctx)
+ {
+     webrtc_t *rtc = (webrtc_t *)ctx;
++    if (rtc->stopping) {
++        return ESP_PEER_ERR_NONE;
++    }
+     ESP_LOGI(TAG, "PeerConnectionState: %d", state);
+     if (state == ESP_PEER_STATE_CONNECTED ||
+         state == ESP_PEER_STATE_DISCONNECTED ||
+@@ -437,7 +462,14 @@ static int pc_on_state(esp_peer_state_t state, void *ctx)
+     if (state == ESP_PEER_STATE_CANDIDATE_GATHERING) {
+         pc_notify_app(rtc, ESP_WEBRTC_EVENT_CONNECTING);
+     } else if (state == ESP_PEER_STATE_CONNECTED) {
+-        start_stream(rtc);
++        int ret = start_stream(rtc);
++        if (ret != ESP_CAPTURE_ERR_OK) {
++            ESP_LOGE(TAG, "Connected transport could not start media: %d", ret);
++            rtc->peer_state = ESP_PEER_STATE_CONNECT_FAILED;
++            stop_stream(rtc);
++            pc_notify_app(rtc, ESP_WEBRTC_EVENT_CONNECT_FAILED);
++            return ret;
++        }
+         pc_notify_app(rtc, ESP_WEBRTC_EVENT_CONNECTED);
+     } else if (state == ESP_PEER_STATE_PAIRED) {
+         pc_notify_app(rtc, ESP_WEBRTC_EVENT_PAIRED);
+@@ -515,6 +547,9 @@ static void convert_dec_vid_info(esp_peer_video_stream_info_t *info, av_render_v
+ static int pc_on_video_info(esp_peer_video_stream_info_t *info, void *ctx)
+ {
+     webrtc_t *rtc = (webrtc_t *)ctx;
++    if (rtc->stopping) {
++        return ESP_PEER_ERR_NONE;
++    }
+     av_render_video_info_t video_info = {};
+     convert_dec_vid_info(info, &video_info);
+     av_render_add_video_stream(rtc->play_handle, &video_info);
+@@ -551,6 +586,9 @@ static void convert_dec_aud_info(esp_peer_audio_stream_info_t *info, av_render_a
+ static int pc_on_audio_info(esp_peer_audio_stream_info_t *info, void *ctx)
+ {
+     webrtc_t *rtc = (webrtc_t *)ctx;
++    if (rtc->stopping) {
++        return ESP_PEER_ERR_NONE;
++    }
+     rtc->recv_aud_info = *info;
+     av_render_audio_info_t audio_info = {};
+     convert_dec_aud_info(info, &audio_info);
+@@ -563,7 +601,7 @@ static int pc_on_audio_info(esp_peer_audio_stream_info_t *info, void *ctx)
+ static int pc_on_audio_data(esp_peer_audio_frame_t *info, void *ctx)
+ {
+     webrtc_t *rtc = (webrtc_t *)ctx;
+-    if (rtc->running == false || rtc->recv_aud_info.codec == ESP_PEER_AUDIO_CODEC_NONE) {
++    if (rtc->stopping || rtc->running == false || rtc->recv_aud_info.codec == ESP_PEER_AUDIO_CODEC_NONE) {
+         return 0;
+     }
+     rtc->aud_recv_pts = info->pts;
+@@ -581,7 +619,7 @@ static int pc_on_audio_data(esp_peer_audio_frame_t *info, void *ctx)
+ static int pc_on_video_data(esp_peer_video_frame_t *info, void *ctx)
+ {
+     webrtc_t *rtc = (webrtc_t *)ctx;
+-    if (rtc->running == false) {
++    if (rtc->stopping || rtc->running == false) {
+         return 0;
+     }
+     rtc->vid_recv_num++;
+@@ -691,10 +729,9 @@ static esp_capture_format_id_t get_capture_video_codec(esp_peer_audio_codec_t vi
+     }
+ }
+ 
+-static int pc_close(webrtc_t *rtc)
++static void pc_stop_loop(webrtc_t *rtc)
+ {
+     if (rtc->pc) {
+-        esp_peer_disconnect(rtc->pc);
+         bool still_running = rtc->running;
+         // Wait for PC task quit
+         if (rtc->pause) {
+@@ -705,6 +742,14 @@ static int pc_close(webrtc_t *rtc)
+         if (still_running) {
+             WAIT_FOR_BITS(PC_EXIT_BIT);
+         }
++    }
++}
++
++static int pc_close(webrtc_t *rtc)
++{
++    pc_stop_loop(rtc);
++    if (rtc->pc) {
++        esp_peer_disconnect(rtc->pc);
+         esp_peer_close(rtc->pc);
+         rtc->pc = NULL;
+     }
+@@ -806,12 +851,9 @@ static int pc_start(webrtc_t *rtc, esp_peer_ice_server_cfg_t *server_info, int s
+     }
+     media_lib_event_group_create(&rtc->wait_event);
+     if (rtc->wait_event == NULL) {
+-        return ESP_PEER_ERR_NO_MEM;
++        ret = ESP_PEER_ERR_NO_MEM;
++        goto fail;
+     }
+-    // Set running flag
+-    rtc->running = true;
+-    media_lib_thread_handle_t thread;
+-    media_lib_thread_create_from_scheduler(&thread, "pc_task", pc_task, rtc);
+     esp_capture_sink_cfg_t sink_cfg = {
+         .audio_info = {
+             .format_id = get_capture_audio_codec(peer_cfg.audio_info.codec),
+@@ -835,11 +877,36 @@ static int pc_start(webrtc_t *rtc, esp_peer_ice_server_cfg_t *server_info, int s
+     if (peer_cfg.video_dir == ESP_PEER_MEDIA_DIR_RECV_ONLY) {
+         sink_cfg.video_info.format_id = ESP_CAPTURE_FMT_ID_NONE;
+     }
+-    esp_capture_sink_setup(rtc->media_provider.capture, 0, &sink_cfg, &rtc->capture_path);
+-    pc_apply_capture_pre_setting(rtc, WEBRTC_PRE_SETTING_MASK_ALL);
++    ret = esp_capture_sink_setup(rtc->media_provider.capture, 0, &sink_cfg, &rtc->capture_path);
++    if (ret != ESP_CAPTURE_ERR_OK) {
++        goto fail;
++    }
++    ret = pc_apply_capture_pre_setting(rtc, WEBRTC_PRE_SETTING_MASK_ALL);
++    if (ret != ESP_CAPTURE_ERR_OK) {
++        goto fail;
++    }
+     if (rtc->no_auto_capture == false) {
+-        esp_capture_sink_enable(rtc->capture_path, ESP_CAPTURE_RUN_MODE_ALWAYS);
++        ret = esp_capture_sink_enable(rtc->capture_path, ESP_CAPTURE_RUN_MODE_ALWAYS);
++        if (ret != ESP_CAPTURE_ERR_OK) {
++            goto fail;
++        }
++    }
++    // Do not expose a running peer until its capture path is fully configured.
++    rtc->running = true;
++    media_lib_thread_handle_t thread = NULL;
++    ret = media_lib_thread_create_from_scheduler(&thread, "pc_task", pc_task, rtc);
++    if (ret != 0) {
++        rtc->running = false;
++        goto fail;
++    }
++    return ret;
++fail:
++    ESP_LOGE(TAG, "Peer media/task setup failed: %d", ret);
++    rtc->stopping = true;
++    if (rtc->capture_path) {
++        esp_capture_sink_enable(rtc->capture_path, ESP_CAPTURE_RUN_MODE_DISABLE);
+     }
++    pc_close(rtc);
+     return ret;
+ }
+ 
+@@ -858,13 +925,21 @@ static int start_peer_connection(webrtc_t *rtc, esp_peer_signaling_ice_info_t *i
+ static int signal_ice_received(esp_peer_signaling_ice_info_t *info, void *ctx)
+ {
+     webrtc_t *rtc = (webrtc_t *)ctx;
++    if (rtc->stopping) {
++        return ESP_PEER_ERR_WRONG_STATE;
++    }
+     rtc->ice_info_loaded = true;
+     rtc->ice_info = *info;
+     if (rtc->pending_connect) {
+         ESP_LOGI(TAG, "Pending connection until user enable");
+         return ESP_PEER_ERR_NONE;
+     }
+-    return start_peer_connection(rtc, info);
++    int ret = start_peer_connection(rtc, info);
++    if (ret != ESP_PEER_ERR_NONE) {
++        rtc->peer_state = ESP_PEER_STATE_CONNECT_FAILED;
++        pc_notify_app(rtc, ESP_WEBRTC_EVENT_CONNECT_FAILED);
++    }
++    return ret;
+ }
+ 
+ static int signal_connected(void *ctx)
+@@ -938,7 +1013,9 @@ static int signal_closed(void *ctx)
+     webrtc_t *rtc = (webrtc_t *)ctx;
+     rtc->signaling_connected = false;
+     // TODO disconnect if peer closed
+-    esp_peer_disconnect(rtc->pc);
++    if (rtc->pc) {
++        esp_peer_disconnect(rtc->pc);
++    }
+     return 0;
+ }
+ 
+@@ -951,6 +1028,9 @@ int esp_webrtc_open(esp_webrtc_cfg_t *cfg, esp_webrtc_handle_t *handle)
+     if (rtc == NULL) {
+         return ESP_PEER_ERR_NO_MEM;
+     }
++    atomic_init(&rtc->running, false);
++    atomic_init(&rtc->stopping, false);
++    atomic_init(&rtc->send_going, false);
+     // TODO deep copy of other settings
+     rtc->rtc_cfg = *cfg;
+     rtc->rtc_cfg.peer_cfg.server_num = 0;
+@@ -1007,9 +1087,12 @@ int esp_webrtc_enable_peer_connection(esp_webrtc_handle_t handle, bool enable)
+         }
+     } else {
+         // Close connection better than reconnect?
++        rtc->stopping = true;
++        pc_stop_loop(rtc);
+         rtc->recv_vid_info.codec = ESP_PEER_VIDEO_CODEC_NONE;
+         stop_stream(rtc);
+         pc_close(rtc);
++        rtc->stopping = false;
+     }
+     return ret;
+ }
+@@ -1078,6 +1161,7 @@ int esp_webrtc_start(esp_webrtc_handle_t handle)
+         ESP_LOGW(TAG, "Already started");
+         return ESP_PEER_ERR_WRONG_STATE;
+     }
++    rtc->stopping = false;
+ 
+     // Start signaling firstly
+     esp_peer_signaling_cfg_t sig_cfg = {
+@@ -1187,6 +1271,10 @@ int esp_webrtc_stop(esp_webrtc_handle_t handle)
+     }
+     webrtc_t *rtc = (webrtc_t *)handle;
+     int ret = 0;
++    // Quiesce callbacks before resetting the shared capture/render providers.
++    // Keep the peer alive until the audio sender has released its last frame.
++    rtc->stopping = true;
++    pc_stop_loop(rtc);
+     stop_stream(rtc);
+     // TODO stop agent
+     pc_close(rtc);
+diff --git a/components/webrtc_utils/webrtc_utils_time.c b/components/webrtc_utils/webrtc_utils_time.c
+index d868258..fdb7ba4 100644
+--- a/components/webrtc_utils/webrtc_utils_time.c
++++ b/components/webrtc_utils/webrtc_utils_time.c
+@@ -44,15 +44,9 @@ void webrtc_utils_get_time_iso8601(char time_buf[18])
+ 
+ esp_err_t webrtc_utils_wait_for_time_sync(uint32_t timeout_ms)
+ {
+-    /* wait for time to be set */
+-    int retry = 0;
+-    int max_retries = timeout_ms / 2000; /* split the retries in 2 seconds each */
+-
+-    while (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(2000)) != ESP_OK && ++retry < max_retries) {
+-        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, max_retries);
+-    }
+-
+-    return ESP_OK;
++    // A plausible clock or build timestamp is not evidence of SNTP completion.
++    // Preserve timeout/error results so HTTPS callers can keep waiting safely.
++    return esp_netif_sntp_sync_wait(pdMS_TO_TICKS(timeout_ms));
+ }
+ 
+ esp_err_t webrtc_utils_time_sync_init()
+@@ -70,7 +64,7 @@ esp_err_t webrtc_utils_time_sync_init()
+ #else
+     esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+ #endif
+-    esp_netif_sntp_init(&config);
+-    init_done = true;
+-    return ESP_OK;
++    esp_err_t ret = esp_netif_sntp_init(&config);
++    if (ret == ESP_OK) init_done = true;
++    return ret;
+ }
+diff --git a/solutions/agora_demo/CMakeLists.txt b/solutions/agora_demo/CMakeLists.txt
+index a996224..bbbe297 100644
+--- a/solutions/agora_demo/CMakeLists.txt
++++ b/solutions/agora_demo/CMakeLists.txt
+@@ -6,6 +6,11 @@ list(APPEND EXTRA_COMPONENT_DIRS "../common")
+ 
+ project(agora_demo)
+ 
++if(CONFIG_STACKCHAN_INTERACTIVE_AI)
++    include(cmake/stackchan_capture_cache.cmake)
++    stackchan_apply_capture_cache_fix()
++endif()
++
+ # esp_asrc 1.0.1 has a uint32_t/%d diagnostic promoted to an error by IDF.
+ if(TARGET __idf_espressif__esp_asrc)
+     target_compile_options(__idf_espressif__esp_asrc
+diff --git a/solutions/agora_demo/cmake/stackchan_capture_cache.cmake b/solutions/agora_demo/cmake/stackchan_capture_cache.cmake
+new file mode 100644
+index 0000000..605e342
+--- /dev/null
++++ b/solutions/agora_demo/cmake/stackchan_capture_cache.cmake
+@@ -0,0 +1,60 @@
++# Keep the vendor checkout unchanged. ESP Capture 1.1.2 assumes AFE feed and
++# fetch chunks have equal sizes; voice-call AEC can feed 160 and fetch 512.
++function(stackchan_replace_once variable before after)
++    set(value "${${variable}}")
++    string(FIND "${value}" "${before}" first)
++    if(first LESS 0)
++        message(FATAL_ERROR "StackChan capture patch: expected source fragment missing")
++    endif()
++    string(LENGTH "${before}" fragment_length)
++    math(EXPR tail_start "${first} + ${fragment_length}")
++    string(SUBSTRING "${value}" ${tail_start} -1 tail)
++    string(FIND "${tail}" "${before}" duplicate)
++    if(NOT duplicate LESS 0)
++        message(FATAL_ERROR "StackChan capture patch: source fragment is not unique")
++    endif()
++    string(REPLACE "${before}" "${after}" value "${value}")
++    set(${variable} "${value}" PARENT_SCOPE)
++endfunction()
++
++function(stackchan_prepare_capture_source source output)
++    file(READ "${source}" code)
++    stackchan_replace_once(code
++        "    int                         cache_size;\n"
++        "    int                         cache_size; // AFE feed bytes, also used by ADC/VAD input\n    int                         fetch_cache_size; // Independent mono output capacity\n")
++    stackchan_replace_once(code
++        "    src->cache_size = audio_chunksize * (16 / 8);\n"
++        "    src->cache_size = audio_chunksize * (16 / 8);\n    int fetch_chunksize = src->afe_handle->get_fetch_chunksize(src->afe_data);\n    src->fetch_cache_size = (fetch_chunksize > audio_chunksize ? fetch_chunksize : audio_chunksize) * (16 / 8);\n    ESP_LOGI(TAG, \"AFE buffers feed=%d fetch=%d output_bytes=%d\", audio_chunksize, fetch_chunksize, src->fetch_cache_size);\n")
++    stackchan_replace_once(code
++        "    src->cached_frame = capture_calloc(1, src->cache_size);\n"
++        "    src->cached_frame = capture_calloc(1, src->fetch_cache_size);\n")
++    stackchan_replace_once(code
++        "            if (res->data_size <= src->cache_size) {\n"
++        "            if (res->data_size <= src->fetch_cache_size) {\n")
++    file(WRITE "${output}" "${code}")
++endfunction()
++
++function(stackchan_apply_capture_cache_fix)
++    idf_component_get_property(capture_dir espressif__esp_capture COMPONENT_DIR)
++    idf_component_get_property(capture_target espressif__esp_capture COMPONENT_LIB)
++    set(original "${capture_dir}/impl/capture_audio_src/capture_audio_aec_src.c")
++    set(patched "${CMAKE_CURRENT_BINARY_DIR}/stackchan_capture_audio_aec_src.c")
++    get_target_property(sources ${capture_target} SOURCES)
++    set(replaced 0)
++    set(replacement_sources "")
++    foreach(source IN LISTS sources)
++        if(source STREQUAL original OR source STREQUAL "impl/capture_audio_src/capture_audio_aec_src.c")
++            math(EXPR replaced "${replaced} + 1")
++            list(APPEND replacement_sources "${patched}")
++        else()
++            list(APPEND replacement_sources "${source}")
++        endif()
++    endforeach()
++    if(NOT replaced EQUAL 1)
++        message(FATAL_ERROR "StackChan capture patch: expected exactly one original target source, found ${replaced}")
++    endif()
++    stackchan_prepare_capture_source("${original}" "${patched}")
++    set_property(TARGET ${capture_target} PROPERTY SOURCES "${replacement_sources}")
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${original}")
++    message(STATUS "StackChan: separate AFE feed/fetch cache in generated capture source")
++endfunction()
+diff --git a/solutions/agora_demo/main/CMakeLists.txt b/solutions/agora_demo/main/CMakeLists.txt
+index 84bd2f7..9ce9aad 100644
+--- a/solutions/agora_demo/main/CMakeLists.txt
++++ b/solutions/agora_demo/main/CMakeLists.txt
+@@ -1,14 +1,40 @@
++if(CONFIG_STACKCHAN_AUDIO_PROBE)
++    idf_component_register(SRCS "stackchan_probe.c" INCLUDE_DIRS "."
++        REQUIRES esp_timer espressif__esp_board_manager espressif__esp_codec_dev espressif__esp_capture)
++    return()
++endif()
++
++set(stackchan_display_sources "")
++if(CONFIG_STACKCHAN_STATUS_SCREEN)
++    list(APPEND stackchan_display_sources "status_screen.c")
++endif()
++if(CONFIG_STACKCHAN_INTERACTIVE_AI)
++    list(APPEND stackchan_display_sources "stackchan_touch.c" "stackchan_interaction.c" "task_diagnostics.c" "stackchan_afe.c")
++endif()
++
++set(stackchan_motion_requires "")
++if(CONFIG_STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS)
++    list(APPEND stackchan_display_sources "stackchan_tls_diagnostics.c")
++endif()
++if(CONFIG_STACKCHAN_HEAD_MOTION)
++    list(APPEND stackchan_display_sources "stackchan_motion.c")
++    list(APPEND stackchan_motion_requires esp_driver_uart esp_driver_i2c espressif__esp_io_expander)
++endif()
++
+ idf_component_register(
+     SRCS
+-        "main.c"
++        ${stackchan_display_sources}
++        "stackchan_human.c"
+         "board.c"
+         "media_sys.c"
+         "webrtc.c"
+-        "agora_auth.c"
+         "agora_signaling.c"
+-        "bot_station.c"
+     INCLUDE_DIRS "."
+     REQUIRES
++        ${stackchan_motion_requires}
++        esp_lcd
++        espressif__esp_lcd_ili9341
++        espressif__esp_lcd_touch
+         av_render
+         common
+         console
+@@ -21,9 +47,23 @@ idf_component_register(
+         espressif__esp_audio_codec
+         espressif__esp_board_manager
+         espressif__esp_capture
++        espressif__esp-sr
+         espressif__esp_codec_dev
+         mbedtls
+         nvs_flash
+         espressif__cjson
+         webrtc_utils
+ )
++
++if(CONFIG_STACKCHAN_INTERACTIVE_AI)
++    # Scope ESP Capture's fixed SR request to the local voice-call profile.
++    # Force extraction from libmain before esp_capture's wrapped reference is seen.
++    target_link_libraries(${COMPONENT_LIB} INTERFACE
++        "-Wl,--wrap=afe_config_init" "-Wl,--undefined=__wrap_afe_config_init")
++endif()
++
++if(CONFIG_STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS)
++    target_link_libraries(${COMPONENT_LIB} INTERFACE
++        "-Wl,--wrap=mbedtls_esp_enable_debug_log"
++        "-Wl,--undefined=__wrap_mbedtls_esp_enable_debug_log")
++endif()
+diff --git a/solutions/agora_demo/main/Kconfig.projbuild b/solutions/agora_demo/main/Kconfig.projbuild
+index 4a81268..6846a55 100644
+--- a/solutions/agora_demo/main/Kconfig.projbuild
++++ b/solutions/agora_demo/main/Kconfig.projbuild
+@@ -1,3 +1,79 @@
++config STACKCHAN_AUDIO_PROBE
++    bool "Run offline StackChan audio hardware probe"
++    default n
++
++config STACKCHAN_PROBE_AEC
++    bool "Use ESP Capture AEC in the offline probe"
++    depends on STACKCHAN_AUDIO_PROBE
++    default n
++
++config STACKCHAN_CALL_SECONDS
++    int "Maximum HUMAN_ONLY test session duration (seconds)"
++    range 60 1800
++    default 720
++    help
++        Bounded call window. The device closes media automatically afterward.
++        Allow time for the browser to join before measuring sustained audio.
++
++config STACKCHAN_STATUS_SCREEN
++    bool "Show lightweight status on verified StackChan ILI9342C"
++    default y
++    help
++        Actual device panel was identified as ILI9342C by the original firmware.
++        Uses Board Manager LCD ownership without M5Unified audio initialization.
++
++config STACKCHAN_INTERACTIVE_AI
++    bool "Official default face with touch start/stop AI"
++    depends on !STACKCHAN_AUDIO_PROBE
++    select STACKCHAN_STATUS_SCREEN
++    default y
++    help
++        Reuses the proven duplex media provider. A host service creates short
++        sessions only after touch. No microphone publication while idle.
++
++config STACKCHAN_HEAD_MOTION
++    bool "Small head poses for idle and incoming calls"
++    depends on STACKCHAN_INTERACTIVE_AI
++    default n
++    help
++        Uses the verified StackChan motor controller and preserved calibration.
++        Idle lowers the head; AI and incoming calls lift it smoothly. Human
++        connection and call audio hold the pose. Motor failures disable motion
++        without blocking calls. Enable only on the supported StackChan hardware.
++
++config STACKCHAN_INTERACTIVE_TEST_SECONDS
++    int "Bounded interactive bench test (0 for normal operation)"
++    depends on STACKCHAN_INTERACTIVE_AI
++    range 0 1800
++    default 0
++
++config STACKCHAN_MEDIA_DIAGNOSTICS
++    bool "Log numeric PCM and task runtime diagnostics"
++    default n
++    help
++        Aggregate post-AEC audio levels and selected task runtime only.
++        Does not store raw audio or transcripts.
++
++config STACKCHAN_NETWORK_DIAGNOSTICS
++    bool "Log bounded control-network stage diagnostics"
++    depends on STACKCHAN_INTERACTIVE_AI && LOG_MAXIMUM_LEVEL >= 4
++    default n
++    help
++        Numeric request stages, timings, signal strength and heap on failures.
++        Successful requests log only the first success or recovery. Enables
++        DEBUG at runtime only for esp-tls (hostname, selected IP and handshake
++        stages); HTTP headers and bodies are never enabled. Requires maximum
++        log level DEBUG while the default runtime log level remains INFO.
++
++config STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS
++    bool "Log allowlisted TLS handshake phases and byte counts"
++    depends on STACKCHAN_NETWORK_DIAGNOSTICS && MBEDTLS_DEBUG
++    default n
++    help
++        Replace the raw ESP mbedTLS logger with a strict metadata-only callback.
++        Requires mbedTLS debug INFO (2); level 3/4 configurations fail compilation.
++        Logs only during control requests, with no raw debug lines or buffers.
++
+ menu "Agora Bot Station duplex audio demo"
+ 
+ config AGORA_DEMO_APP_ID
+diff --git a/solutions/agora_demo/main/common.h b/solutions/agora_demo/main/common.h
+index b5778eb..ffd4bb5 100644
+--- a/solutions/agora_demo/main/common.h
++++ b/solutions/agora_demo/main/common.h
+@@ -12,4 +12,6 @@ int start_webrtc(const char *url, const char *token);
+ void query_webrtc(void);
+ void media_sys_query(void);
+ bool webrtc_needs_restart(void);
++bool webrtc_is_connected(void);
+ int stop_webrtc(void);
++void webrtc_set_uplink_enabled(bool enabled);
+diff --git a/solutions/agora_demo/main/idf_component.yml b/solutions/agora_demo/main/idf_component.yml
+index f08adf7..1d6de17 100644
+--- a/solutions/agora_demo/main/idf_component.yml
++++ b/solutions/agora_demo/main/idf_component.yml
+@@ -1,4 +1,6 @@
+ dependencies:
++  espressif/m5stack_boards:
++    version: "0.6.2"
+   idf:
+     version: ">=5.4.4"
+   espressif/esp_peer:
+diff --git a/solutions/agora_demo/main/media_sys.c b/solutions/agora_demo/main/media_sys.c
+index 156280b..0d07be8 100644
+--- a/solutions/agora_demo/main/media_sys.c
++++ b/solutions/agora_demo/main/media_sys.c
+@@ -2,6 +2,7 @@
+ 
+ #include <stdint.h>
+ #include <string.h>
++#include <math.h>
+ 
+ #include "av_render.h"
+ #include "av_render_default.h"
+@@ -13,15 +14,217 @@
+ #include "esp_capture_defaults.h"
+ #include "esp_codec_dev.h"
+ #include "esp_log.h"
++#include "esp_timer.h"
+ #include "settings.h"
+ 
+ #define TAG "AGORA_MEDIA"
+ #define AUDIO_RENDER_FIFO_SIZE (16 * 1024)
+-#define AUDIO_PLAYOUT_THRESHOLD_MS 100
++// The peer already has a jitter buffer. av_render's threshold path repeatedly
++// re-arms when fewer than three queue items remain, including normal Opus DTX.
++#define AUDIO_PLAYOUT_THRESHOLD_MS 0
++// The codec's default curve maps 0..100 to -50..0 dB. 55 adds 5 dB
++// over the verified volume 45, without digitally amplifying the PCM stream.
++#define STACKCHAN_SPEAKER_VOLUME 55
+ 
+ static esp_capture_handle_t capture;
+ static esp_capture_audio_src_if_t *audio_source;
+ static av_render_handle_t player;
++static esp_capture_err_t (*source_start)(esp_capture_audio_src_if_t *);
++static esp_codec_dev_handle_t meter_record;
++
++#ifdef CONFIG_STACKCHAN_MEDIA_DIAGNOSTICS
++static esp_capture_err_t (*source_read_frame)(esp_capture_audio_src_if_t *, esp_capture_stream_frame_t *);
++static bool raw_meter_enabled;
++static struct {
++    uint64_t mic_energy, ref_energy;
++    int64_t mic_sum, ref_sum, cross;
++    uint32_t pairs, mic_peak, ref_peak, timeouts, errors;
++    int64_t started_us;
++} raw_meter;
++
++static esp_capture_err_t metered_source_start(esp_capture_audio_src_if_t *src)
++{
++    memset(&raw_meter, 0, sizeof(raw_meter));
++    raw_meter_enabled = false;
++    // Configure before the source starts its feeder. The public mirror API does
++    // not require an open ADC; esp_codec_dev_open preserves this ring buffer.
++    int mirror_result = esp_codec_dev_mirror_cfg(meter_record, 2048);
++    esp_capture_err_t ret = source_start(src);
++    if (ret != ESP_CAPTURE_ERR_OK) return ret;
++    raw_meter_enabled = mirror_result == ESP_CODEC_DEV_OK;
++    raw_meter.started_us = esp_timer_get_time();
++    float gain = 0;
++    int gain_result = esp_codec_dev_get_in_gain(meter_record, &gain);
++    ESP_LOGI(TAG, "ADC_GAIN gain_db_x10=%d ret=%d mirror_ret=%d",
++             (int)(gain * 10), gain_result, mirror_result);
++    for (int reg = 0x41; reg <= 0x48; ++reg) {
++        int value = -1;
++        int result = esp_codec_dev_read_reg(meter_record, reg, &value);
++        ESP_LOGI(TAG, "ADC_REG %02x=%02x ret=%d", reg, value, result);
++    }
++    return ret;
++}
++
++static void raw_input_meter(void)
++{
++    if (!raw_meter_enabled) return;
++    // This scratch buffer lives on the existing AUD_SRC PSRAM stack. The mirror
++    // returns the same packed 16-bit M,R pairs as the AEC input after layout
++    // conversion. Read a bounded subset; never delay capture waiting for data.
++    int16_t scratch[256];
++    int bytes_read = 0;
++    int ret = esp_codec_dev_mirror_read(meter_record, (uint8_t *)scratch,
++                                      sizeof(scratch), 0, &bytes_read);
++    if (ret == ESP_CODEC_DEV_TIMEOUT) ++raw_meter.timeouts;
++    else if (ret != ESP_CODEC_DEV_OK) ++raw_meter.errors;
++    if (bytes_read < 0 || bytes_read > (int)sizeof(scratch) || bytes_read % 4 != 0) {
++        raw_meter_enabled = false;
++        ESP_LOGW(TAG, "Raw input meter disabled: unaligned mirror result");
++        return;
++    }
++    for (int i = 0; i < bytes_read / (int)sizeof(*scratch); i += 2) {
++        int32_t mic = scratch[i], ref = scratch[i + 1];
++        uint32_t mic_abs = mic < 0 ? -mic : mic;
++        uint32_t ref_abs = ref < 0 ? -ref : ref;
++        if (mic_abs > raw_meter.mic_peak) raw_meter.mic_peak = mic_abs;
++        if (ref_abs > raw_meter.ref_peak) raw_meter.ref_peak = ref_abs;
++        raw_meter.mic_energy += (int64_t)mic * mic;
++        raw_meter.ref_energy += (int64_t)ref * ref;
++        raw_meter.mic_sum += mic;
++        raw_meter.ref_sum += ref;
++        raw_meter.cross += (int64_t)mic * ref;
++        ++raw_meter.pairs;
++    }
++    int64_t now = esp_timer_get_time();
++    if (now - raw_meter.started_us < 2000000) return;
++    uint32_t n = raw_meter.pairs;
++    unsigned mic_rms = n ? (unsigned)sqrt((double)raw_meter.mic_energy / n) : 0;
++    unsigned ref_rms = n ? (unsigned)sqrt((double)raw_meter.ref_energy / n) : 0;
++    int correlation = 0, correlation_valid = 0;
++    if (n) {
++        double mic_variance = raw_meter.mic_energy - (double)raw_meter.mic_sum * raw_meter.mic_sum / n;
++        double ref_variance = raw_meter.ref_energy - (double)raw_meter.ref_sum * raw_meter.ref_sum / n;
++        if (mic_variance > 0 && ref_variance > 0) {
++            double covariance = raw_meter.cross - (double)raw_meter.mic_sum * raw_meter.ref_sum / n;
++            correlation = (int)(1000 * covariance / sqrt(mic_variance * ref_variance));
++            correlation_valid = 1;
++        }
++    }
++    ESP_LOGI(TAG, "RAW_ADC mic_rms16=%u mic_peak16=%lu ref_rms16=%u ref_peak16=%lu corr_permille=%d corr_valid=%d pairs=%lu window_ms=%lu timeouts=%lu errors=%lu",
++             mic_rms, (unsigned long)raw_meter.mic_peak, ref_rms, (unsigned long)raw_meter.ref_peak,
++             correlation, correlation_valid, (unsigned long)n,
++             (unsigned long)((now - raw_meter.started_us) / 1000),
++             (unsigned long)raw_meter.timeouts, (unsigned long)raw_meter.errors);
++    memset(&raw_meter, 0, sizeof(raw_meter));
++    raw_meter.started_us = now;
++}
++
++// Observe AEC output before encoding. Only aggregate scalar measurements are
++// retained; the caller's PCM buffer and source return value remain unchanged.
++static esp_capture_err_t uplink_meter(esp_capture_audio_src_if_t *src,
++                                     esp_capture_stream_frame_t *frame)
++{
++    int64_t read_started_us = esp_timer_get_time();
++    esp_capture_err_t ret = source_read_frame(src, frame);
++    if (ret != ESP_CAPTURE_ERR_OK || !frame || !frame->data || frame->size < 2) return ret;
++    raw_input_meter();
++    static uint64_t energy;
++    static uint32_t sampled_values, pcm_samples, sampled_peak, blocks, previous_pts;
++    static int64_t window_started_us;
++    static bool have_pts;
++    if (have_pts && frame->pts <= previous_pts) {
++        // A restarted capture has a new PTS origin; never mix session windows.
++        energy = 0; sampled_values = 0; pcm_samples = 0; sampled_peak = 0; blocks = 0;
++    }
++    if (!pcm_samples) window_started_us = read_started_us;
++    previous_pts = frame->pts;
++    have_pts = true;
++    const int16_t *pcm = (const int16_t *)frame->data;
++    uint32_t count = frame->size / sizeof(*pcm);
++    for (uint32_t i = 0; i < count; i += 4) {
++        int32_t value = pcm[i];
++        uint32_t magnitude = value < 0 ? -value : value;
++        if (magnitude > sampled_peak) sampled_peak = magnitude;
++        energy += (int64_t)value * value;
++        ++sampled_values;
++    }
++    pcm_samples += count;
++    ++blocks;
++    if (pcm_samples >= AGORA_DEMO_AUDIO_SAMPLE_RATE * 2) {
++        ESP_LOGI(TAG, "UPLINK_PCM blocks=%lu rms16=%u sampled_peak16=%lu sampled_values=%lu stride=4 audio_ms=%lu elapsed_ms=%lu",
++                 (unsigned long)blocks, (unsigned)sqrt((double)energy / sampled_values),
++                 (unsigned long)sampled_peak, (unsigned long)sampled_values,
++                 (unsigned long)((uint64_t)pcm_samples * 1000 / AGORA_DEMO_AUDIO_SAMPLE_RATE),
++                 (unsigned long)((esp_timer_get_time() - window_started_us) / 1000));
++        energy = 0; sampled_values = 0; pcm_samples = 0; sampled_peak = 0; blocks = 0;
++    }
++    return ret;
++}
++#endif
++
++static esp_capture_err_t calibrated_source_start(esp_capture_audio_src_if_t *src)
++{
++#ifdef CONFIG_STACKCHAN_MEDIA_DIAGNOSTICS
++    esp_capture_err_t ret = metered_source_start(src);
++#else
++    esp_capture_err_t ret = source_start(src);
++#endif
++    if (ret != ESP_CAPTURE_ERR_OK) return ret;
++    // The previously working M5Unified input used MIC1/MIC2 register 0x1b
++    // (33 dB), plus software scaling. This provider originally used 18 dB.
++    // Start conservatively at 30 dB on the actual microphone only; keep MIC3
++    // electrical-reference gain at the measured 18 dB to preserve AEC headroom.
++    // The installed ES7210 driver's 33 dB conversion returns the 30 dB code,
++    // so request the supported value explicitly and verify the register.
++    int gain_ret = esp_codec_dev_set_in_channel_gain(meter_record, 1u << 0, 30.0f);
++    int mic_register = -1, reference_register = -1;
++    int mic_ret = esp_codec_dev_read_reg(meter_record, 0x43, &mic_register);
++    int ref_ret = esp_codec_dev_read_reg(meter_record, 0x45, &reference_register);
++    ESP_LOGI(TAG, "Input calibration mic_db=30 reference_db=18 gain_ret=%d mic_reg=%02x ref_reg=%02x",
++             gain_ret, mic_register, reference_register);
++    if (gain_ret != ESP_CODEC_DEV_OK || mic_ret != ESP_CODEC_DEV_OK ||
++        ref_ret != ESP_CODEC_DEV_OK || (mic_register & 0x0f) != 0x0a ||
++        (reference_register & 0x0f) != 0x06) {
++        ESP_LOGE(TAG, "Input gain verification failed");
++        src->stop(src);
++        return ESP_CAPTURE_ERR_INTERNAL;
++    }
++    return ret;
++}
++
++// Called only after a successful codec write. Aggregate levels only: no audio
++// recording. Fixed output below is signed stereo 32-bit, measured on a 16-bit scale.
++static int playback_meter(uint8_t *data, int size, void *ctx)
++{
++    static bool registers_logged;
++    if (!registers_logged) {
++        const int regs[] = {0x01, 0x04, 0x05, 0x06, 0x0c};
++        for (int i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++            int value = -1;
++            int ret = esp_codec_dev_read_reg((esp_codec_dev_handle_t)ctx, regs[i], &value);
++            ESP_LOGI(TAG, "DAC_REG %02x=%04x ret=%d", regs[i], value, ret);
++        }
++        registers_logged = true;
++    }
++    static uint64_t energy;
++    static uint32_t samples, peak, blocks;
++    const int32_t *pcm = (const int32_t *)data;
++    for (int i = 0; i < size / (int)sizeof(int32_t); ++i) {
++        int32_t v = pcm[i] / 65536;
++        uint32_t magnitude = v < 0 ? -v : v;
++        if (magnitude > peak) peak = magnitude;
++        energy += (int64_t)v * v;
++        ++samples;
++    }
++    ++blocks;
++    if (samples >= AGORA_DEMO_AUDIO_SAMPLE_RATE * 2 * 2) {
++        ESP_LOGI(TAG, "DAC_PCM written_blocks=%lu rms16=%u peak16=%lu samples=%lu",
++                 (unsigned long)blocks, (unsigned)sqrt((double)energy / samples),
++                 (unsigned long)peak, (unsigned long)samples);
++        energy = 0; samples = 0; peak = 0; blocks = 0;
++    }
++    return 0;
++}
+ 
+ static esp_codec_dev_handle_t get_record_handle(void)
+ {
+@@ -33,7 +236,7 @@ static esp_codec_dev_handle_t get_record_handle(void)
+         ESP_LOGE(TAG, "Failed to get audio ADC handle");
+         return NULL;
+     }
+-    esp_codec_dev_set_in_gain(codec_handle->codec_dev, 32);
++    esp_codec_dev_set_in_gain(codec_handle->codec_dev, 18);
+     return codec_handle->codec_dev;
+ }
+ 
+@@ -47,7 +250,11 @@ static esp_codec_dev_handle_t get_playback_handle(void)
+         ESP_LOGE(TAG, "Failed to get audio DAC handle");
+         return NULL;
+     }
+-    esp_codec_dev_set_out_vol(codec_handle->codec_dev, 70);
++    if (esp_codec_dev_set_out_vol(codec_handle->codec_dev, STACKCHAN_SPEAKER_VOLUME) != ESP_CODEC_DEV_OK) {
++        ESP_LOGE(TAG, "Failed to set speaker volume");
++        return NULL;
++    }
++    ESP_LOGI(TAG, "Speaker volume=%d", STACKCHAN_SPEAKER_VOLUME);
+     return codec_handle->codec_dev;
+ }
+ 
+@@ -117,11 +324,27 @@ int media_sys_buildup(void)
+         .record_handle = record_handle,
+     };
+     fill_aec_source_cfg(record_handle, &source_cfg);
++    // The verified CoreS3 TDM wire order is FL,RE,FR. Select one microphone
++    // plus the electrical reference for the first real-time RTC gate, avoiding
++    // two-microphone BSS overhead. Keep full-duplex AEC and continuous output.
++    source_cfg.mic_layout = "MR";
++    source_cfg.channel = 4;
++    source_cfg.channel_mask = 0x3;
++    source_cfg.data_on_vad = false;
+     audio_source = esp_capture_new_audio_aec_src(&source_cfg);
+     if (audio_source == NULL) {
+         ESP_LOGE(TAG, "Failed to create the audio capture source");
+         return -1;
+     }
++    meter_record = record_handle;
++    source_start = audio_source->start;
++    audio_source->start = calibrated_source_start;
++#ifdef CONFIG_STACKCHAN_MEDIA_DIAGNOSTICS
++    if (audio_source->read_frame && audio_source->start) {
++        source_read_frame = audio_source->read_frame;
++        audio_source->read_frame = uplink_meter;
++    }
++#endif
+ 
+     esp_capture_cfg_t capture_cfg = {
+         .sync_mode = ESP_CAPTURE_SYNC_MODE_NONE,
+@@ -140,6 +363,8 @@ int media_sys_buildup(void)
+     }
+     i2s_render_cfg_t render_cfg = {
+         .play_handle = playback_handle,
++        .cb = playback_meter,
++        .ctx = playback_handle,
+     };
+     audio_render_handle_t audio_render =
+         av_render_alloc_i2s_render(&render_cfg);
+@@ -165,7 +390,11 @@ int media_sys_buildup(void)
+     av_render_audio_frame_info_t playback_info = {
+         .sample_rate = AGORA_DEMO_AUDIO_SAMPLE_RATE,
+         .channel = 2,
+-        .bits_per_sample = 16,
++        // CoreS3 ES7210 RX needs a four-slot 16-bit frame. AW88298 TX must
++        // explicitly use stereo 32-bit samples on that shared 64-BCLK bus;
++        // 16-bit app data lets the bus widen slots without updating the DAC.
++        // Verified on the actual StackChan by speaker-reference capture.
++        .bits_per_sample = 32,
+     };
+     av_render_set_fixed_frame_info(player, &playback_info);
+ 
+diff --git a/solutions/agora_demo/main/stackchan_afe.c b/solutions/agora_demo/main/stackchan_afe.c
+new file mode 100644
+index 0000000..6171308
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_afe.c
+@@ -0,0 +1,52 @@
++#include <string.h>
++#include <stdatomic.h>
++#include "stackchan_afe.h"
++#include "esp_afe_config.h"
++#include "esp_log.h"
++
++static atomic_bool human_call;
++
++void stackchan_afe_set_human_call(bool enabled)
++{
++    atomic_store(&human_call, enabled);
++}
++
++// ESP Capture 1.1.2 creates an SR profile internally and exposes no AFE config
++// callback. The interactive target wraps only that exact MR/low-cost request;
++// all other callers retain the SDK behavior. No managed component is patched.
++afe_config_t *__real_afe_config_init(const char *input_format,
++                                   srmodel_list_t *models,
++                                   afe_type_t type, afe_mode_t mode);
++
++afe_config_t *__wrap_afe_config_init(const char *input_format,
++                                   srmodel_list_t *models,
++                                   afe_type_t type, afe_mode_t mode)
++{
++    bool voice_profile = atomic_load(&human_call) && input_format && strcmp(input_format, "MR") == 0 &&
++                         type == AFE_TYPE_SR && mode == AFE_MODE_LOW_COST;
++    afe_config_t *cfg = __real_afe_config_init(input_format, models,
++                                             voice_profile ? AFE_TYPE_FD : type, mode);
++    if (!cfg || !voice_profile) return cfg;
++
++    cfg->aec_init = true;
++    // Full-duplex uses the proven SR FFT canceller plus residual suppression,
++    // avoiding the VOIP FIR/resampler path that overloaded this device.
++    cfg->aec_mode = AEC_MODE_FD_LOW_COST;
++    cfg->aec_nlp_level = AEC_NLP_LEVEL_AGGR;
++    cfg->ns_init = true;
++    // This SDK treats every non-NULL name as an external NSNet model name.
++    // NULL selects its built-in WebRTC suppressor; the header's "WEBRTC"
++    // string hint does not match the installed implementation.
++    cfg->ns_model_name = NULL;
++    cfg->afe_ns_mode = AFE_NS_MODE_WEBRTC;
++    cfg->agc_init = false;
++    cfg->vad_init = false;
++    cfg->wakenet_init = false;
++    cfg->se_init = false;
++
++    // Keep the SDK's filter length, linear gain, task placement and allocations.
++    // Fetch remains continuous; silence gating would impair a two-way call.
++    ESP_LOGI("STACKCHAN_AFE", "FD low-cost MR; NLP=AGGR NS=WEBRTC; AGC/VAD/WakeNet/SE=off; filter=%d linear_gain_x100=%d",
++             cfg->aec_filter_length, (int)(cfg->afe_linear_gain * 100));
++    return cfg;
++}
+diff --git a/solutions/agora_demo/main/stackchan_afe.h b/solutions/agora_demo/main/stackchan_afe.h
+new file mode 100644
+index 0000000..6e746d5
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_afe.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include <stdbool.h>
++
++// Select before opening media, after the preceding session has fully closed.
++// AI keeps the verified SDK speech-recognition profile; human RTC gets FD + NS.
++void stackchan_afe_set_human_call(bool enabled);
+diff --git a/solutions/agora_demo/main/stackchan_human.c b/solutions/agora_demo/main/stackchan_human.c
+new file mode 100644
+index 0000000..4c60a6a
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_human.c
+@@ -0,0 +1,282 @@
++// HUMAN_ONLY PoC: no Bot Station, no Agent, no certificate signing.
++#include <stdbool.h>
++#include <string.h>
++#include <time.h>
++#include <sys/time.h>
++#include "common.h"
++#include "esp_capture.h"
++#include "esp_event.h"
++#include "esp_netif.h"
++#include "esp_wifi.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "esp_heap_caps.h"
++#include "nvs_flash.h"
++#include "nvs.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "media_lib_adapter.h"
++#include "media_lib_os.h"
++#include "webrtc_utils_time.h"
++#include "stackchan_session_local.h"
++#ifdef CONFIG_STACKCHAN_HEAD_MOTION
++#include "stackchan_motion.h"
++#endif
++#ifdef CONFIG_STACKCHAN_INTERACTIVE_AI
++#include "stackchan_touch.h"
++#include "stackchan_interaction.h"
++#endif
++#ifdef CONFIG_STACKCHAN_STATUS_SCREEN
++#include "status_screen.h"
++#define SHOW_STATUS(label) stackchan_status_show(label)
++#define TICK_STATUS() stackchan_status_tick((uint32_t)(esp_timer_get_time() / 1000))
++#else
++#define SHOW_STATUS(label) ((void)0)
++#define TICK_STATUS() ((void)0)
++#endif
++
++static const char *TAG = "STACKCHAN_HUMAN";
++static volatile bool online;
++bool network_is_connected(void) { return online; }
++
++static void thread_scheduler(const char *name, media_lib_thread_cfg_t *cfg)
++{
++    if (strcmp(name, "aenc_0") == 0) {
++        cfg->stack_size = 40 * 1024;
++        cfg->priority = 9;
++        cfg->core_id = 1;
++    } else if (strcmp(name, "AUD_SRC") == 0) {
++        cfg->stack_size = 16 * 1024;
++        cfg->priority = 10;
++        cfg->core_id = 1;
++    } else if (strcmp(name, "buffer_in") == 0) {
++        // Feed must outrank AFE fetch; otherwise fetch can starve its producer.
++        cfg->stack_size = 16 * 1024;
++        cfg->priority = 16;
++        cfg->core_id = 1;
++    } else if (strcmp(name, "Adec") == 0) {
++        cfg->stack_size = 40 * 1024;
++        cfg->priority = 12;
++        cfg->core_id = 0;
++    } else if (strcmp(name, "ARender") == 0) {
++        cfg->stack_size = 8 * 1024;
++        cfg->priority = 13;
++        cfg->core_id = 0;
++    } else if (strcmp(name, "pc_task") == 0) {
++        cfg->stack_size = 25 * 1024;
++        cfg->priority = 18;
++        cfg->core_id = 0;
++    }
++}
++
++static void capture_scheduler(const char *name,
++                              esp_capture_thread_schedule_cfg_t *cfg)
++{
++    media_lib_thread_cfg_t thread_cfg = {
++        .stack_size = cfg->stack_size,
++        .priority = cfg->priority,
++        .core_id = cfg->core_id,
++    };
++    // Reserve scarce internal RAM for the AEC feeder and Opus encoder. Moving
++    // every worker inside exhausted internal RAM while starting AUD_SRC.
++    cfg->stack_in_ext = strcmp(name, "aenc_0") != 0 && strcmp(name, "buffer_in") != 0;
++    thread_scheduler(name, &thread_cfg);
++    cfg->stack_size = thread_cfg.stack_size;
++    cfg->priority = thread_cfg.priority;
++    cfg->core_id = thread_cfg.core_id;
++}
++
++
++static void wifi_event(void *ctx, esp_event_base_t base, int32_t id, void *data)
++{
++    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
++    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
++        online = false;
++        const wifi_event_sta_disconnected_t *event = data;
++        ESP_LOGW(TAG, "Wi-Fi disconnected reason=%u", (unsigned)event->reason);
++        esp_wifi_connect();
++    }
++    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
++        online = true;
++        ESP_LOGI(TAG, "Wi-Fi ready");
++    }
++}
++
++static void connect_wifi(void)
++{
++    ESP_ERROR_CHECK(esp_netif_init());
++    ESP_ERROR_CHECK(esp_event_loop_create_default());
++    esp_netif_create_default_wifi_sta();
++    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
++    init.nvs_enable = 0;
++    ESP_ERROR_CHECK(esp_wifi_init(&init));
++    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
++    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
++    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
++    wifi_config_t cfg = {0};
++    strlcpy((char *)cfg.sta.ssid, STACKCHAN_WIFI_SSID, sizeof(cfg.sta.ssid));
++    strlcpy((char *)cfg.sta.password, STACKCHAN_WIFI_PASSWORD, sizeof(cfg.sta.password));
++    // Match the working whale's precedence; read saved user configuration only.
++    // Never erase NVS or fall back to an automatic reformat on init failure.
++#ifndef STACKCHAN_WIFI_OVERRIDE
++    if (nvs_flash_init() == ESP_OK) {
++        nvs_handle_t saved;
++        if (nvs_open("wifi", NVS_READONLY, &saved) == ESP_OK) {
++            char ssid[33] = {0}, password[65] = {0};
++            size_t ssid_size=sizeof(ssid), password_size=sizeof(password);
++            if (nvs_get_str(saved, "ssid", ssid, &ssid_size) == ESP_OK &&
++                nvs_get_str(saved, "password", password, &password_size) == ESP_OK && ssid[0]) {
++                strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
++                strlcpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password));
++                ESP_LOGI(TAG, "Using saved whale Wi-Fi configuration");
++            }
++            nvs_close(saved);
++        }
++    }
++#endif
++    cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
++    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
++    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
++    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
++    ESP_ERROR_CHECK(esp_wifi_start());
++}
++
++void app_main(void)
++{
++    vTaskDelay(pdMS_TO_TICKS(2000));
++#ifdef CONFIG_STACKCHAN_INTERACTIVE_AI
++    ESP_LOGI(TAG, "Official default avatar; touch start/stop AI; host-signed credentials");
++#else
++    ESP_LOGI(TAG, "HUMAN_ONLY; no Agent; credentials signed outside firmware");
++#endif
++    media_lib_add_default_adapter();
++    esp_capture_set_thread_scheduler(capture_scheduler);
++    media_lib_thread_set_schedule_cb(thread_scheduler);
++    if (init_board()) {
++        ESP_LOGE(TAG, "Board initialization failed"); return;
++    }
++#ifdef CONFIG_STACKCHAN_STATUS_SCREEN
++    if (stackchan_status_init() != 0) {
++        ESP_LOGW(TAG, "Status screen unavailable; continuing audio test");
++    }
++#endif
++    SHOW_STATUS("STARTING");
++    if (media_sys_buildup()) {
++        SHOW_STATUS("ERROR");
++        ESP_LOGE(TAG, "Media initialization failed"); return;
++    }
++#ifdef CONFIG_STACKCHAN_HEAD_MOTION
++    // Supply/expander setup is serialized before touch or interaction tasks.
++    // Motor discovery and smooth movement run asynchronously off audio core1.
++    if (stackchan_motion_init() != ESP_OK) {
++        ESP_LOGW(TAG, "Head motion unavailable; continuing without movement");
++    } else {
++        stackchan_motion_request(STACKCHAN_MOTION_REST);
++    }
++#endif
++    bool cloud_control = false;
++#ifdef CONFIG_STACKCHAN_INTERACTIVE_AI
++    cloud_control = strncmp(STACKCHAN_CONTROL_URL, "https://", 8) == 0;
++#endif
++    if (cloud_control) webrtc_set_uplink_enabled(false);
++    SHOW_STATUS("WIFI");
++    connect_wifi();
++    unsigned wifi_waits = 0;
++    while (!online && (cloud_control || wifi_waits < 300)) {
++        vTaskDelay(pdMS_TO_TICKS(100));
++        TICK_STATUS();
++        ++wifi_waits;
++        if (cloud_control && !online && wifi_waits % 100 == 0) {
++            ESP_LOGW(TAG, "Waiting for Wi-Fi; cloud microphone remains idle");
++        }
++    }
++    if (!online) { SHOW_STATUS("ERROR"); ESP_LOGE(TAG, "Wi-Fi timeout"); return; }
++    if (cloud_control) {
++        // No controller/media session is started until a real SNTP response.
++        // Keep the face alive while Wi-Fi/SNTP retries; build time is only a
++        // LAN development fallback and cannot validate renewed cloud certs.
++        SHOW_STATUS("SYNCING TIME");
++        bool sntp_started = false;
++        int64_t next_notice = 0;
++        for (;;) {
++            if (online && !sntp_started) sntp_started = webrtc_utils_time_sync_init() == ESP_OK;
++            if (online && sntp_started && webrtc_utils_wait_for_time_sync(100) == ESP_OK &&
++                time(NULL) >= 1704067200) break;
++            TICK_STATUS();
++            if (esp_timer_get_time() >= next_notice) {
++                ESP_LOGW(TAG, "Waiting for network time; cloud microphone remains idle");
++                next_notice = esp_timer_get_time() + 10000000;
++            }
++            vTaskDelay(pdMS_TO_TICKS(100));
++        }
++    } else {
++        if (webrtc_utils_time_sync_init() != ESP_OK) return;
++        webrtc_utils_wait_for_time_sync(5000);
++    }
++    time_t now = time(NULL);
++#ifdef STACKCHAN_BUILD_UNIX_TIME
++    // Temporary bench-test fallback when UDP NTP is unavailable. The timestamp
++    // comes from this trusted development host; the WHIP server still enforces
++    // the signed JWT expiry against its own clock. Cloud time bootstrap remains
++    // a production requirement; do not ship long-lived builds with this alone.
++    if (!cloud_control && now < STACKCHAN_BUILD_UNIX_TIME) {
++        struct timeval tv = {.tv_sec = STACKCHAN_BUILD_UNIX_TIME + esp_timer_get_time()/1000000};
++        settimeofday(&tv, NULL);
++        now = time(NULL);
++        ESP_LOGW(TAG, "Using trusted build-time clock fallback for this short PoC");
++    }
++#endif
++    if (now < 1704067200
++#ifndef CONFIG_STACKCHAN_INTERACTIVE_AI
++        || now >= STACKCHAN_SESSION_EXPIRY
++#endif
++    ) {
++        SHOW_STATUS("ERROR");
++        ESP_LOGE(TAG, "Clock invalid or short-lived credential expired"); return;
++    }
++#ifdef CONFIG_STACKCHAN_INTERACTIVE_AI
++    if (stackchan_touch_init() != ESP_OK || stackchan_interaction_init() != 0) {
++        SHOW_STATUS("INPUT ERROR");
++        ESP_LOGE(TAG, "Interactive initialization failed; microphone remains idle");
++        return;
++    }
++    ESP_LOGI(TAG, "Touch ready; tap face to start or stop AI");
++    const int64_t test_deadline = CONFIG_STACKCHAN_INTERACTIVE_TEST_SECONDS == 0 ? INT64_MAX :
++        esp_timer_get_time() + (int64_t)CONFIG_STACKCHAN_INTERACTIVE_TEST_SECONDS * 1000000;
++    while (esp_timer_get_time() < test_deadline) {
++        uint32_t tick = (uint32_t)(esp_timer_get_time() / 1000);
++        if (stackchan_touch_take_tap(tick)) stackchan_interaction_tap();
++        SHOW_STATUS(stackchan_interaction_label());
++        TICK_STATUS();
++        vTaskDelay(pdMS_TO_TICKS(25));
++    }
++    stackchan_interaction_shutdown();
++    while (!stackchan_interaction_stopped()) vTaskDelay(pdMS_TO_TICKS(50));
++    SHOW_STATUS("ENDED");
++    ESP_LOGI(TAG, "PoC session closed; interactive bench finished");
++    return;
++#endif
++    SHOW_STATUS("CONNECTING");
++    if (start_webrtc(STACKCHAN_WHIP_URL, STACKCHAN_WHIP_TOKEN)) { SHOW_STATUS("ERROR"); return; }
++    ESP_LOGI(TAG, "Bounded call window: %d seconds", CONFIG_STACKCHAN_CALL_SECONDS);
++    const int64_t call_deadline = esp_timer_get_time() + (int64_t)CONFIG_STACKCHAN_CALL_SECONDS * 1000000;
++    int64_t next_query = esp_timer_get_time() + 5000000;
++    while (esp_timer_get_time() < call_deadline) {
++        vTaskDelay(pdMS_TO_TICKS(100));
++        TICK_STATUS();
++        if (esp_timer_get_time() < next_query) continue;
++        next_query = esp_timer_get_time() + 5000000;
++        query_webrtc();
++        media_sys_query();
++        SHOW_STATUS(webrtc_is_connected() ? "READY" : "CONNECTING");
++        ESP_LOGI(TAG, "Internal heap free=%u minimum=%u largest=%u psram_free=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
++        if (!online || webrtc_needs_restart() || time(NULL) >= STACKCHAN_SESSION_EXPIRY) break;
++    }
++    stop_webrtc();
++    SHOW_STATUS("ENDED");
++    ESP_LOGI(TAG, "PoC session closed; no automatic Agent resume");
++}
+diff --git a/solutions/agora_demo/main/stackchan_interaction.c b/solutions/agora_demo/main/stackchan_interaction.c
+new file mode 100644
+index 0000000..4749482
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_interaction.c
+@@ -0,0 +1,933 @@
++#include "stackchan_interaction.h"
++#include "stackchan_afe.h"
++#include "task_diagnostics.h"
++#include <stdatomic.h>
++#include <errno.h>
++#include <limits.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <sys/time.h>
++#include "cJSON.h"
++#include "common.h"
++#include "esp_heap_caps.h"
++#include "esp_http_client.h"
++#include "esp_crt_bundle.h"
++#include "esp_log.h"
++#include "esp_random.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "lwip/sockets.h"
++#include "stackchan_session_local.h"
++#ifdef CONFIG_STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS
++#include "stackchan_tls_diagnostics.h"
++#endif
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++#include "esp_wifi.h"
++#endif
++#ifdef CONFIG_STACKCHAN_HEAD_MOTION
++#include "stackchan_motion.h"
++#endif
++
++#define RESPONSE_BYTES 2048
++#define WORKER_STACK_BYTES (16 * 1024)
++#define POLL_US 1000000LL
++#define IDLE_POLL_MAX_US 30000000LL
++#define ACCEPT_TIMEOUT_US 45000000LL
++typedef enum { IDLE, AI_STARTING, AI_ACTIVE, RING_STARTING, RINGING,
++               ACCEPTING, HUMAN_CONNECTING, HUMAN_ACTIVE, RESUMING,
++               STOPPING, FAILED } phase_t;
++typedef enum { COMMAND_NONE, COMMAND_START, COMMAND_STOP, COMMAND_ACCEPT,
++               COMMAND_END, COMMAND_SHUTDOWN } command_t;
++typedef enum { MEDIA_NONE, MEDIA_AI, MEDIA_HUMAN } media_t;
++typedef enum { CALL_NONE, CALL_RINGING, CALL_ACCEPTING, CALL_CONNECTING,
++               CALL_ACTIVE, CALL_ENDED } call_state_t;
++
++static const char *TAG = "STACKCHAN_CALL";
++static atomic_int phase;
++static atomic_uint generation;
++static atomic_bool shutting_down;
++static atomic_bool quiescent = true;
++static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
++static command_t pending_command;
++static StaticTask_t worker_tcb;
++static TaskHandle_t worker;
++
++typedef struct {
++    media_t media;
++    bool ai_requested;             // Explicit companion intent, not temporary ring AI.
++    bool resume_ai;
++    bool human_uplink;
++    char ai_request_id[33];        // Retained until /ai/stop confirms cleanup.
++    char ai_session_id[65];
++    char call_id[33];
++    char finished_call_id[33];
++    char reason[49];
++    call_state_t call_state;
++    char url[256];                 // Must outlive the WebRTC signaling session.
++    char token[1024];
++    time_t expires;
++    unsigned idle_poll_failures;
++    int64_t next_poll, next_heartbeat, next_query, next_action, accepting_since;
++} interaction_t;
++
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++enum { TRACE_CONNECTED, TRACE_HEADERS_SENT, TRACE_STATUS, TRACE_HEADERS_COMPLETE,
++       TRACE_BODY, TRACE_FINISH, TRACE_EVENT_COUNT };
++typedef struct {
++    unsigned request, handle, connection;
++    bool cold_handle;
++    unsigned count[TRACE_EVENT_COUNT];
++    int64_t started_us, first_ms[TRACE_EVENT_COUNT];
++    unsigned body_bytes;
++} control_trace_t;
++// Single control-worker ownership, including synchronous HTTP callbacks.
++static unsigned trace_request, trace_handle, trace_connection, trace_current_connection;
++static bool trace_had_success, trace_recovering;
++
++static void trace_increment(unsigned *value)
++{
++    if (*value < UINT_MAX) ++*value;
++}
++
++static void trace_event(control_trace_t *trace, unsigned event)
++{
++    if (!trace->count[event]) trace->first_ms[event] = (esp_timer_get_time() - trace->started_us) / 1000;
++    trace_increment(&trace->count[event]);
++}
++#endif
++
++typedef struct {
++    char data[RESPONSE_BYTES]; size_t used; bool overflow, connected;
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    control_trace_t trace;
++#endif
++} response_t;
++typedef enum { CONTROL_OK, CONTROL_TRANSPORT, CONTROL_HTTP, CONTROL_PROTOCOL,
++               CONTROL_AUTH, CONTROL_PENDING, CONTROL_LOCAL } control_kind_t;
++typedef struct {
++    // Only successful replies own JSON. Error codes point to fixed literals;
++    // neither an upstream body nor a borrowed JSON string escapes control().
++    cJSON *json;
++    control_kind_t kind;
++    esp_err_t transport;
++    int http_status;
++    const char *code;
++} control_result_t;
++
++static const char *control_error_code(const cJSON *json)
++{
++    static const char *const allowed[] = {
++        "cleanup_pending", "forbidden", "service_unavailable", "service_not_enabled",
++        "rate_limited", "invalid_request", "session_busy", "session_not_active",
++        "session_expired", "request_already_stopped", "human_call_in_progress",
++        "call_not_current", "call_not_accepted", "call_not_connecting",
++    };
++    const cJSON *error = cJSON_GetObjectItemCaseSensitive(json, "error");
++    if (cJSON_IsString(error)) {
++        for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i)
++            if (!strcmp(error->valuestring, allowed[i])) return allowed[i];
++    }
++    return "unclassified";
++}
++
++// Owned exclusively by session_worker. Keep the TLS connection across polls;
++// audio tasks and touch handlers never access this handle.
++static esp_http_client_handle_t control_client;
++
++static void close_control(void)
++{
++    if (control_client) esp_http_client_cleanup(control_client);
++    control_client = NULL;
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    trace_current_connection = 0;
++#endif
++}
++
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++static void log_control_trace(const response_t *response, control_kind_t kind, int status, int64_t elapsed_ms)
++{
++    const control_trace_t *t = &response->trace;
++    ESP_LOGI(TAG, "Control stages req=%u handle=%u connection=%u cold_handle=%d kind=%d status=%d elapsed_ms=%lld recovery=%d",
++             t->request, t->handle, t->connection, t->cold_handle, kind, status, (long long)elapsed_ms, trace_recovering);
++    // Counts and first-event offsets only. Never inspect header/status event
++    // payloads here; in particular no URLs, authorization or JSON are logged.
++    ESP_LOGI(TAG, "Control events req=%u connected=%u/%lld headers_sent=%u/%lld status=%u/%lld headers_complete=%u/%lld body=%u/%lld body_bytes=%u finish=%u/%lld",
++             t->request, t->count[TRACE_CONNECTED], (long long)t->first_ms[TRACE_CONNECTED],
++             t->count[TRACE_HEADERS_SENT], (long long)t->first_ms[TRACE_HEADERS_SENT],
++             t->count[TRACE_STATUS], (long long)t->first_ms[TRACE_STATUS],
++             t->count[TRACE_HEADERS_COMPLETE], (long long)t->first_ms[TRACE_HEADERS_COMPLETE],
++             t->count[TRACE_BODY], (long long)t->first_ms[TRACE_BODY], t->body_bytes,
++             t->count[TRACE_FINISH], (long long)t->first_ms[TRACE_FINISH]);
++    if (kind != CONTROL_OK) {
++        wifi_ap_record_t ap = {0};
++        esp_err_t wifi_result = esp_wifi_sta_get_ap_info(&ap);
++        ESP_LOGI(TAG, "Control environment req=%u wifi_result=%d rssi=%d channel=%u internal_free=%u internal_largest=%u",
++                 t->request, wifi_result, wifi_result == ESP_OK ? ap.rssi : -128,
++                 wifi_result == ESP_OK ? (unsigned)ap.primary : 0,
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
++    }
++}
++#endif
++
++static bool current(unsigned epoch)
++{
++    return !atomic_load(&shutting_down) && atomic_load(&generation) == epoch;
++}
++
++// Publish only a desired pose. The motion API is atomic/nonblocking: no motor
++// I/O, allocation or waits here, including while holding the UI state lock.
++static void request_phase_motion(phase_t value)
++{
++#ifdef CONFIG_STACKCHAN_HEAD_MOTION
++    stackchan_motion_pose_t pose = STACKCHAN_MOTION_ATTENTIVE;
++    if (value == IDLE) pose = STACKCHAN_MOTION_REST;
++    else if (value == ACCEPTING || value == HUMAN_CONNECTING || value == HUMAN_ACTIVE ||
++             value == STOPPING || value == FAILED) pose = STACKCHAN_MOTION_HOLD;
++    stackchan_motion_request(pose);
++#else
++    (void)value;
++#endif
++}
++
++static bool motion_pose_ready(void)
++{
++#ifdef CONFIG_STACKCHAN_HEAD_MOTION
++    // A disabled/failed motor returns ready so calls never depend on movement.
++    return stackchan_motion_settled();
++#else
++    return true;
++#endif
++}
++
++static void show_phase(phase_t value)
++{
++    portENTER_CRITICAL(&state_lock);
++    if (pending_command == COMMAND_NONE && !atomic_load(&shutting_down)) {
++        atomic_store(&phase, value);
++        request_phase_motion(value);
++    }
++    portEXIT_CRITICAL(&state_lock);
++}
++
++static bool enable_uplink(unsigned epoch)
++{
++    bool allowed;
++    portENTER_CRITICAL(&state_lock);
++    allowed = current(epoch) && pending_command == COMMAND_NONE;
++    if (allowed) webrtc_set_uplink_enabled(true);
++    portEXIT_CRITICAL(&state_lock);
++    return allowed;
++}
++
++static void set_control_nodelay(esp_http_client_handle_t client)
++{
++    // ON_CONNECTED runs after TLS completes and before HTTP writes. Apply once
++    // to this connection only; never retain or close its borrowed socket.
++    int saved_errno = errno;
++    int fd = esp_http_client_get_socket(client);
++    int enabled = 1, result = -1, option_errno = 0;
++    if (fd >= 0) {
++        result = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
++        if (result != 0) option_errno = errno;
++    }
++    if (result != 0) {
++        ESP_LOGW(TAG, "Control nodelay socket_valid=%d set_result=%d errno=%d", fd >= 0, result, option_errno);
++    }
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    else {
++        int readback = -1;
++        socklen_t length = sizeof(readback);
++        int read_result = getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &readback, &length);
++        int read_errno = read_result != 0 ? errno : 0;
++        if (read_result != 0 || length != sizeof(readback)) readback = -1;
++        ESP_LOGI(TAG, "Control nodelay socket_valid=1 set_result=0 read_result=%d read_errno=%d enabled=%d",
++                 read_result, read_errno, readback);
++    }
++#endif
++    // Even a failed option/readback or logger must not change HTTP error state.
++    errno = saved_errno;
++}
++
++static esp_err_t receive_http(esp_http_client_event_t *event)
++{
++    response_t *r = event->user_data;
++    if (event->event_id == HTTP_EVENT_ON_CONNECTED) {
++        set_control_nodelay(event->client);
++        if (r) r->connected = true;
++    }
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    if (r) {
++        switch (event->event_id) {
++        case HTTP_EVENT_ON_CONNECTED:
++            trace_increment(&trace_connection);
++            r->trace.connection = trace_current_connection = trace_connection;
++            trace_event(&r->trace, TRACE_CONNECTED); break;
++        case HTTP_EVENT_HEADERS_SENT: trace_event(&r->trace, TRACE_HEADERS_SENT); break;
++        case HTTP_EVENT_ON_STATUS_CODE: trace_event(&r->trace, TRACE_STATUS); break;
++        case HTTP_EVENT_ON_HEADERS_COMPLETE: trace_event(&r->trace, TRACE_HEADERS_COMPLETE); break;
++        case HTTP_EVENT_ON_FINISH: trace_event(&r->trace, TRACE_FINISH); break;
++        case HTTP_EVENT_ON_DATA:
++            if (event->data_len > 0) {
++                trace_event(&r->trace, TRACE_BODY);
++                unsigned bytes = (unsigned)event->data_len;
++                r->trace.body_bytes = bytes > UINT_MAX - r->trace.body_bytes ? UINT_MAX : r->trace.body_bytes + bytes;
++            }
++            break;
++        default: break;
++        }
++    }
++#endif
++    if (r && event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
++        if ((size_t)event->data_len >= sizeof(r->data) - r->used) {
++            r->overflow = true; return ESP_FAIL;
++        }
++        memcpy(r->data + r->used, event->data, event->data_len);
++        r->used += event->data_len;
++        r->data[r->used] = 0;
++    }
++    return ESP_OK;
++}
++
++// A provisioned HTTPS origin is used in cloud mode; HTTP remains available for
++// the private LAN fallback. Never follow redirects with the device bearer key.
++static control_result_t control(const char *path, const char *body, int timeout_ms)
++{
++    char url[192];
++    response_t response = {0};
++    control_result_t result = {.kind = CONTROL_LOCAL, .code = "local_configuration"};
++    bool secure = strncmp(STACKCHAN_CONTROL_URL, "https://", 8) == 0;
++    if (!secure && strncmp(STACKCHAN_CONTROL_URL, "http://", 7) != 0) return result;
++    if (secure && timeout_ms < 5000) timeout_ms = 5000;
++    int length = snprintf(url, sizeof(url), "%s%s", STACKCHAN_CONTROL_URL, path);
++    if (length < 0 || length >= (int)sizeof(url)) return result;
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    trace_increment(&trace_request);
++    response.trace.request = trace_request;
++    response.trace.cold_handle = !control_client;
++    for (unsigned i = 0; i < TRACE_EVENT_COUNT; ++i) response.trace.first_ms[i] = -1;
++#endif
++    if (!control_client) {
++        esp_http_client_config_t cfg = {
++            .url = url, .method = HTTP_METHOD_POST, .timeout_ms = timeout_ms,
++            .buffer_size = 512, .buffer_size_tx = 512,
++            .event_handler = receive_http,
++            .disable_auto_redirect = true,
++            .crt_bundle_attach = secure ? esp_crt_bundle_attach : NULL,
++            .keep_alive_enable = true,
++        };
++        control_client = esp_http_client_init(&cfg);
++        if (!control_client) { result.code = "client_initialization"; return result; }
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++        trace_increment(&trace_handle);
++#endif
++    }
++    int64_t started = esp_timer_get_time();
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    response.trace.started_us = started;
++    response.trace.handle = trace_handle;
++    response.trace.connection = trace_current_connection;
++#endif
++    esp_err_t err = esp_http_client_set_url(control_client, url);
++    if (err == ESP_OK) err = esp_http_client_set_timeout_ms(control_client, timeout_ms);
++    if (err == ESP_OK) err = esp_http_client_set_user_data(control_client, &response);
++    if (err == ESP_OK) err = esp_http_client_set_header(control_client, "Authorization", "Bearer " STACKCHAN_CONTROL_KEY);
++    if (err == ESP_OK) err = esp_http_client_set_header(control_client, "Content-Type", "application/json");
++    if (err == ESP_OK) err = esp_http_client_set_post_field(control_client, body, strlen(body));
++    if (err == ESP_OK) {
++#ifdef CONFIG_STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS
++        stackchan_tls_diagnostics_begin(response.trace.request);
++#endif
++        err = esp_http_client_perform(control_client);
++#ifdef CONFIG_STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS
++        stackchan_tls_diagnostics_end();
++#endif
++    }
++    int64_t elapsed_ms = (esp_timer_get_time() - started) / 1000;
++    int status = esp_http_client_get_status_code(control_client);
++    // The client borrows these pointers; neither may outlive this stack frame.
++    esp_http_client_set_user_data(control_client, NULL);
++    esp_http_client_set_post_field(control_client, NULL, 0);
++    result.transport = err;
++    result.http_status = status;
++    if (response.overflow) {
++        result.kind = CONTROL_PROTOCOL;
++        result.code = "response_too_large";
++    } else if (err != ESP_OK) {
++        result.kind = CONTROL_TRANSPORT;
++        result.code = "transport_failed";
++    } else {
++        cJSON *json = cJSON_ParseWithOpts(response.data, NULL, true);
++        if (status != 200) {
++            result.kind = status == 401 || status == 403 ? CONTROL_AUTH : CONTROL_HTTP;
++            result.code = control_error_code(json);
++            if (status == 409 && !strcmp(result.code, "cleanup_pending")) result.kind = CONTROL_PENDING;
++        } else if (!cJSON_IsObject(json)) {
++            result.kind = CONTROL_PROTOCOL;
++            result.code = "invalid_response";
++        } else {
++            result.kind = CONTROL_OK;
++            result.code = "ok";
++            result.json = json;
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++            if (!trace_had_success || trace_recovering) log_control_trace(&response, result.kind, status, elapsed_ms);
++            trace_had_success = true;
++            trace_recovering = false;
++#endif
++            return result;
++        }
++        cJSON_Delete(json);
++    }
++    ESP_LOGW(TAG, "Control %s failed: kind=%d transport=%d status=%d code=%s",
++             path, result.kind, result.transport, result.http_status, result.code);
++    // Read transport evidence before cleanup destroys it. This is numeric only;
++    // connected means an ON_CONNECTED event in this request, not a reused socket.
++    int socket_errno = esp_http_client_get_errno(control_client);
++    int mbed_error = 0, cert_flags = 0;
++    esp_err_t tls_error = esp_http_client_get_and_clear_last_tls_error(control_client, &mbed_error, &cert_flags);
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    log_control_trace(&response, result.kind, status, elapsed_ms);
++    trace_recovering = true;
++    ESP_LOGW(TAG, "Control diagnostic req=%u handle=%u connection=%u cold_handle=%d timeout_ms=%d elapsed_ms=%lld errno=%d tls=%d mbed=%d certflags=%d connected=%d",
++             response.trace.request, response.trace.handle, response.trace.connection, response.trace.cold_handle,
++             timeout_ms, (long long)elapsed_ms, socket_errno, tls_error, mbed_error, cert_flags, response.connected);
++#else
++    ESP_LOGW(TAG, "Control diagnostic timeout_ms=%d elapsed_ms=%lld errno=%d tls=%d mbed=%d certflags=%d connected=%d",
++             timeout_ms, (long long)elapsed_ms, socket_errno, tls_error, mbed_error, cert_flags, response.connected);
++#endif
++    // A normal cleanup wait can reuse its healthy TLS connection. Never replay
++    // any POST automatically; the state owner decides what happens next.
++    if (result.kind != CONTROL_PENDING) close_control();
++    return result;
++}
++
++static control_result_t ai_control(const char *action, const char *key, const char *id, int timeout_ms)
++{
++    char path[32], body[112];
++    snprintf(path, sizeof(path), "/ai/%s", action);
++    snprintf(body, sizeof(body), "{\"%s\":\"%s\"}", key, id);
++    return control(path, body, timeout_ms);
++}
++
++static control_result_t call_control(const interaction_t *ctx, const char *action)
++{
++    char body[112];
++    if (!ctx->call_id[0]) return (control_result_t){.kind = CONTROL_LOCAL, .code = "no_call"};
++    snprintf(body, sizeof(body), "{\"call_id\":\"%s\",\"action\":\"%s\"}", ctx->call_id, action);
++    return control("/device/call", body, 2000);
++}
++
++static bool copy_string(cJSON *json, const char *key, char *out, size_t size)
++{
++    const cJSON *item = cJSON_GetObjectItemCaseSensitive(json, key);
++    if (!cJSON_IsString(item) || !item->valuestring[0] || strlen(item->valuestring) >= size) return false;
++    strcpy(out, item->valuestring); return true;
++}
++
++static bool identifier(const char *value)
++{
++    if (strlen(value) != 32) return false;
++    for (int i = 0; i < 32; ++i)
++        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) return false;
++    return true;
++}
++
++static call_state_t parse_call_state(const char *value)
++{
++    if (strcmp(value, "ringing") == 0) return CALL_RINGING;
++    if (strcmp(value, "accepting") == 0) return CALL_ACCEPTING;
++    if (strcmp(value, "connecting") == 0) return CALL_CONNECTING;
++    if (strcmp(value, "active") == 0) return CALL_ACTIVE;
++    if (strcmp(value, "ended") == 0) return CALL_ENDED;
++    return CALL_NONE;
++}
++
++static bool ingest_call(interaction_t *ctx, cJSON *response)
++{
++    cJSON *call = cJSON_GetObjectItemCaseSensitive(response, "call");
++    if (cJSON_IsNull(call)) return !ctx->call_id[0];
++    char id[33], state_text[16];
++    if (!cJSON_IsObject(call) || !copy_string(call, "id", id, sizeof(id)) || !identifier(id) ||
++        !copy_string(call, "state", state_text, sizeof(state_text))) return false;
++    call_state_t next = parse_call_state(state_text);
++    if (next == CALL_NONE) return false;
++    if (!ctx->call_id[0]) {
++        if (next == CALL_ENDED || strcmp(id, ctx->finished_call_id) == 0) return true;
++        if (next != CALL_RINGING) return false;
++        strcpy(ctx->call_id, id);
++        ctx->resume_ai = ctx->ai_requested;
++        ctx->accepting_since = 0;
++        ctx->next_action = 0;
++        ESP_LOGI(TAG, "Incoming call; prior companion=%d", ctx->resume_ai);
++    } else if (strcmp(ctx->call_id, id) != 0) {
++        return false;
++    }
++    // A late response can never roll an accepted/ended call back to ringing.
++    if (next < ctx->call_state) return false;
++    bool entering_connecting = next == CALL_CONNECTING && ctx->call_state < CALL_CONNECTING;
++    ctx->call_state = next;
++    ctx->reason[0] = 0;
++    cJSON *reason = cJSON_GetObjectItemCaseSensitive(call, "reason");
++    if (cJSON_IsString(reason) && strlen(reason->valuestring) < sizeof(ctx->reason)) strcpy(ctx->reason, reason->valuestring);
++    if ((next == CALL_ACCEPTING && !ctx->accepting_since) || entering_connecting)
++        ctx->accepting_since = esp_timer_get_time();
++    return true;
++}
++
++static const char *poll_state(const interaction_t *ctx)
++{
++    phase_t p = atomic_load(&phase);
++    // Existing cloud announcement gating waits for this state. Keep local
++    // RINGING/tap-to-answer available while a small initial lift completes.
++    if (p == RINGING) return motion_pose_ready() ? "ringing" : "transition";
++    if (p == HUMAN_ACTIVE) return "human";
++    if (p == AI_ACTIVE) return "ai";
++    if ((p == IDLE || p == FAILED) && ctx->media == MEDIA_NONE) return "idle";
++    return "transition";
++}
++
++static bool poll_device(interaction_t *ctx)
++{
++    char body[256];
++    snprintf(body, sizeof(body), "{\"state\":\"%s\",\"ai_session_id\":\"%s\",\"call_id\":\"%s\",\"media_connected\":%s}",
++             poll_state(ctx), ctx->ai_session_id, ctx->call_id,
++             ctx->media != MEDIA_NONE && webrtc_is_connected() ? "true" : "false");
++    // Only a cold standby HTTPS poll may wait longer for a hotspot handshake.
++    // The context/client belong to this worker; snapshot UI intent under its
++    // existing lock, without holding it across network I/O. Active/cleanup/
++    // cancellation paths retain their original bound and generation barrier.
++    portENTER_CRITICAL(&state_lock);
++    phase_t p = atomic_load(&phase);
++    bool standby = (p == IDLE || p == FAILED) && pending_command == COMMAND_NONE && !atomic_load(&shutting_down);
++    portEXIT_CRITICAL(&state_lock);
++    standby = standby && ctx->media == MEDIA_NONE && !ctx->call_id[0] && !ctx->ai_requested &&
++              !ctx->ai_request_id[0] && !ctx->ai_session_id[0];
++    int timeout_ms = standby && !control_client && strncmp(STACKCHAN_CONTROL_URL, "https://", 8) == 0 ? 15000 : 2000;
++    control_result_t result = control("/device/poll", body, timeout_ms);
++    bool ok = result.json && ingest_call(ctx, result.json);
++    cJSON_Delete(result.json);
++    bool idle = ctx->media == MEDIA_NONE && !ctx->call_id[0] && !ctx->ai_requested;
++    int64_t delay = POLL_US;
++    if (ok || !idle) ctx->idle_poll_failures = 0;
++    else {
++        // Equal jitter: 1..2, 2..4, 4..8, 8..16, then 15..30 seconds.
++        // Only standby backs off. Active failures still close audio immediately.
++        if (ctx->idle_poll_failures < 5) ++ctx->idle_poll_failures;
++        int64_t ceiling = POLL_US << ctx->idle_poll_failures;
++        if (ceiling > IDLE_POLL_MAX_US) ceiling = IDLE_POLL_MAX_US;
++        delay = ceiling / 2 + esp_random() % (ceiling / 2 + 1);
++    }
++    ctx->next_poll = esp_timer_get_time() + delay;
++    return ok;
++}
++
++static void close_media(interaction_t *ctx)
++{
++    webrtc_set_uplink_enabled(false);
++    if (ctx->media != MEDIA_NONE) stop_webrtc();
++    ctx->media = MEDIA_NONE;
++    ctx->human_uplink = false;
++    ctx->url[0] = 0;
++    memset(ctx->token, 0, sizeof(ctx->token));
++    ctx->expires = 0;
++}
++
++static bool stop_ai(interaction_t *ctx)
++{
++    if (ctx->media == MEDIA_AI) close_media(ctx);
++    if (!ctx->ai_request_id[0]) return true;
++    cJSON *reply = ai_control("stop", "request_id", ctx->ai_request_id, 5000).json;
++    cJSON *value = reply ? cJSON_GetObjectItemCaseSensitive(reply, "state") : NULL;
++    bool ok = cJSON_IsString(value) && strcmp(value->valuestring, "stopped") == 0;
++    cJSON_Delete(reply);
++    if (ok) {
++        ctx->ai_request_id[0] = 0;
++        ctx->ai_session_id[0] = 0;
++    }
++    return ok;
++}
++
++static void forget_call(interaction_t *ctx)
++{
++    if (ctx->call_id[0]) strcpy(ctx->finished_call_id, ctx->call_id);
++    ctx->call_id[0] = 0;
++    ctx->call_state = CALL_NONE;
++    ctx->resume_ai = false;
++    ctx->accepting_since = 0;
++    ctx->next_action = 0;
++}
++
++static void fail_closed(interaction_t *ctx)
++{
++    webrtc_set_uplink_enabled(false);
++    show_phase(STOPPING);
++    close_media(ctx);
++    ctx->ai_requested = false;
++    ctx->resume_ai = false;
++    if (network_is_connected()) {
++        (void)stop_ai(ctx);
++        cJSON *reply = call_control(ctx, "end").json;
++        cJSON_Delete(reply);
++    }
++    forget_call(ctx);
++    atomic_store(&quiescent, true);
++    show_phase(FAILED);
++    ESP_LOGW(TAG, "Session closed locally; explicit retry required");
++}
++
++static bool poll_or_close(interaction_t *ctx)
++{
++    if (poll_device(ctx)) return true;
++    if (ctx->media != MEDIA_NONE || ctx->call_id[0] || ctx->ai_requested) fail_closed(ctx);
++    else show_phase(FAILED);
++    return false;
++}
++
++static bool normal_end(const char *reason)
++{
++    return strcmp(reason, "caller_hangup") == 0 || strcmp(reason, "device_hangup") == 0 ||
++           strcmp(reason, "rejected") == 0 || strcmp(reason, "caller_cancel") == 0 ||
++           strcmp(reason, "ringing_timeout") == 0;
++}
++
++static void finish_call(interaction_t *ctx, unsigned epoch)
++{
++    bool restore = normal_end(ctx->reason) && ctx->resume_ai;
++    bool keep_ai = restore && ctx->media == MEDIA_AI;
++    if (!keep_ai) close_media(ctx);
++    if (!keep_ai && !stop_ai(ctx)) { fail_closed(ctx); return; }
++    if (!normal_end(ctx->reason)) { fail_closed(ctx); return; }
++    forget_call(ctx);
++    if (!current(epoch)) restore = false;
++    ctx->ai_requested = restore;
++    atomic_store(&quiescent, !keep_ai);
++    if (keep_ai) enable_uplink(epoch);
++    show_phase(keep_ai ? AI_ACTIVE : restore ? RESUMING : IDLE);
++    ESP_LOGI(TAG, "Call ended; restore prior companion=%d", restore);
++}
++
++static bool read_grant(interaction_t *ctx, cJSON *grant, media_t kind)
++{
++    char session_id[65];
++    const cJSON *expires = cJSON_GetObjectItemCaseSensitive(grant, "expires_at");
++    const cJSON *server_time = cJSON_GetObjectItemCaseSensitive(grant, "server_time");
++    const char *prefix = kind == MEDIA_HUMAN ?
++        "https://ap-webrtc-whip.ap.sd-rtn.com/pub/stackchan-human-" :
++        "https://ap-webrtc-whip.ap.sd-rtn.com/pub/stackchan-ai-";
++    if (!copy_string(grant, "session_id", session_id, sizeof(session_id)) || !identifier(session_id) ||
++        (kind == MEDIA_HUMAN && strcmp(session_id, ctx->call_id) != 0) ||
++        !copy_string(grant, "whip_url", ctx->url, sizeof(ctx->url)) ||
++        !copy_string(grant, "whip_token", ctx->token, sizeof(ctx->token)) ||
++        strncmp(ctx->url, prefix, strlen(prefix)) != 0 ||
++        !cJSON_IsNumber(server_time) || server_time->valuedouble < 1704067200 ||
++        !cJSON_IsNumber(expires) || !(expires->valuedouble > server_time->valuedouble) ||
++        !(expires->valuedouble <= server_time->valuedouble + 900)) return false;
++    const char *query = strchr(ctx->url, '?');
++    if (!query || strcmp(query, "?stringuid=20001&duplex=true") != 0) return false;
++    struct timeval tv = {.tv_sec = (time_t)server_time->valuedouble};
++    if (settimeofday(&tv, NULL) != 0) return false;
++    ctx->expires = (time_t)expires->valuedouble;
++    if (kind == MEDIA_AI) strcpy(ctx->ai_session_id, session_id);
++    return true;
++}
++
++static bool open_media(interaction_t *ctx, media_t kind, unsigned epoch)
++{
++    if (!current(epoch) || !network_is_connected() || ctx->media != MEDIA_NONE) return false;
++    webrtc_set_uplink_enabled(false);
++    // The previous capture must be closed before selecting the next DSP profile.
++    stackchan_afe_set_human_call(kind == MEDIA_HUMAN);
++    ctx->media = kind;
++    int result = start_webrtc(ctx->url, ctx->token);
++    // Signaling duplicates bearer_token; signal_url stays owned by this context.
++    memset(ctx->token, 0, sizeof(ctx->token));
++    ctx->next_heartbeat = esp_timer_get_time() + 10000000;
++    ctx->next_query = esp_timer_get_time() + 5000000;
++    return result == 0 && current(epoch);
++}
++
++static void start_ai(interaction_t *ctx, unsigned epoch)
++{
++    atomic_store(&quiescent, false);
++    show_phase(ctx->call_state == CALL_RINGING ? RING_STARTING : AI_STARTING);
++    if (!poll_device(ctx)) { fail_closed(ctx); return; }
++    if (!current(epoch) || ctx->call_state >= CALL_ACCEPTING) return;
++    bool had_cleanup = ctx->ai_request_id[0] != 0;
++    if (!stop_ai(ctx)) { fail_closed(ctx); return; }
++    if (!current(epoch)) return;
++    if (had_cleanup) {
++        // A retry may have retained a cloud session ID after local shutdown.
++        // Confirm its now-empty identity before a fresh grant can be issued.
++        if (!poll_device(ctx)) { fail_closed(ctx); return; }
++        if (!current(epoch) || ctx->call_state >= CALL_ACCEPTING) return;
++    }
++    snprintf(ctx->ai_request_id, sizeof(ctx->ai_request_id), "%08lx%08lx%08lx%08lx",
++             (unsigned long)esp_random(), (unsigned long)esp_random(),
++             (unsigned long)esp_random(), (unsigned long)esp_random());
++    cJSON *grant = ai_control("start", "request_id", ctx->ai_request_id, 30000).json;
++    bool valid = grant && read_grant(ctx, grant, MEDIA_AI);
++    cJSON_Delete(grant);
++    if (!current(epoch)) return;
++    if (!valid) { fail_closed(ctx); return; }
++    // Renew transition grace between the two bounded cloud/signaling operations.
++    if (!poll_device(ctx)) { fail_closed(ctx); return; }
++    if (ctx->call_state >= CALL_ACCEPTING || !current(epoch)) return;
++    if (!open_media(ctx, MEDIA_AI, epoch)) { if (current(epoch)) fail_closed(ctx); return; }
++    if (!poll_device(ctx)) { fail_closed(ctx); return; }
++    if (ctx->call_state >= CALL_ACCEPTING || !current(epoch)) return;
++    if (!enable_uplink(epoch)) return;
++    show_phase(ctx->call_state == CALL_RINGING ? RINGING : AI_STARTING);
++}
++
++static void start_ai_when_pose_ready(interaction_t *ctx, unsigned epoch)
++{
++    // Keep polling and touch cancellation live while lifting. In particular,
++    // an idle incoming call must not start the temporary AI greeting/ASR over
++    // motor noise. Already-attentive, disabled and failed motors do not delay.
++    if (motion_pose_ready()) start_ai(ctx, epoch);
++}
++
++static void accept_step(interaction_t *ctx, unsigned epoch)
++{
++    webrtc_set_uplink_enabled(false);
++    show_phase(ACCEPTING);
++    if (esp_timer_get_time() - ctx->accepting_since > ACCEPT_TIMEOUT_US) { fail_closed(ctx); return; }
++    if (esp_timer_get_time() < ctx->next_action) return;
++    ctx->next_action = esp_timer_get_time() + POLL_US;
++    // Tell the lease owner that blocking media/AI cleanup is about to begin.
++    if (!poll_device(ctx)) { fail_closed(ctx); return; }
++    if (ctx->call_state == CALL_ENDED || !current(epoch)) return;
++    // Privacy barrier: close local capture/playout and confirm cloud AI cleanup
++    // before requesting any credential for the separate private human channel.
++    if (ctx->media != MEDIA_NONE) close_media(ctx);
++    if (!stop_ai(ctx) || !current(epoch)) return;
++    if (!poll_device(ctx)) { fail_closed(ctx); return; }
++    if (ctx->call_state == CALL_ENDED || !current(epoch)) return;
++    if (ctx->call_state != CALL_ACCEPTING && ctx->call_state != CALL_CONNECTING) { fail_closed(ctx); return; }
++    control_result_t result = call_control(ctx, "ready");
++    cJSON *reply = result.json;
++    if (!reply) {
++        // Pending cleanup and temporary upstream failures remain bounded by the
++        // existing accepting deadline. Authentication/protocol faults cannot heal
++        // by repeatedly asking for a human grant.
++        if (result.kind == CONTROL_AUTH || result.kind == CONTROL_PROTOCOL || result.kind == CONTROL_LOCAL)
++            fail_closed(ctx);
++        return;
++    }
++    bool snapshot_ok = ingest_call(ctx, reply);
++    cJSON *grant = cJSON_GetObjectItemCaseSensitive(reply, "grant");
++    bool valid = snapshot_ok && ctx->call_state == CALL_CONNECTING &&
++                 cJSON_IsObject(grant) && read_grant(ctx, grant, MEDIA_HUMAN);
++    cJSON_Delete(reply);
++    if (!current(epoch) || ctx->call_state == CALL_ENDED) return;
++    if (!valid) { fail_closed(ctx); return; }
++    show_phase(HUMAN_CONNECTING);
++    if (!open_media(ctx, MEDIA_HUMAN, epoch)) { if (current(epoch)) fail_closed(ctx); return; }
++    ctx->next_poll = 0;
++    ctx->next_action = 0;
++}
++
++static void human_step(interaction_t *ctx, unsigned epoch)
++{
++    if (ctx->media != MEDIA_HUMAN) {
++        // Retry a lost ready reply through the same confirmed cleanup barrier.
++        accept_step(ctx, epoch);
++        return;
++    }
++    if (!network_is_connected() || webrtc_needs_restart() || time(NULL) >= ctx->expires) { fail_closed(ctx); return; }
++    if (!webrtc_is_connected() || ctx->human_uplink || esp_timer_get_time() < ctx->next_action) return;
++    ctx->next_action = esp_timer_get_time() + POLL_US;
++    if (!poll_device(ctx)) { fail_closed(ctx); return; }
++    if (ctx->call_state == CALL_ENDED || !current(epoch)) return;
++    cJSON *reply = call_control(ctx, "connected").json;
++    if (!reply) return;
++    bool valid = ingest_call(ctx, reply);
++    cJSON_Delete(reply);
++    if (!valid) { fail_closed(ctx); return; }
++    if (ctx->call_state == CALL_ACTIVE && current(epoch)) {
++        ctx->human_uplink = enable_uplink(epoch);
++        if (ctx->human_uplink) show_phase(HUMAN_ACTIVE);
++    }
++}
++
++static void monitor_media(interaction_t *ctx)
++{
++    if (ctx->media == MEDIA_NONE) return;
++    if (!network_is_connected() || webrtc_needs_restart() || time(NULL) >= ctx->expires) { fail_closed(ctx); return; }
++    int64_t now = esp_timer_get_time();
++    if (ctx->media == MEDIA_AI) {
++        if (ctx->call_state >= CALL_ACCEPTING) return;
++        if (webrtc_is_connected()) show_phase(ctx->call_state == CALL_RINGING ? RINGING : AI_ACTIVE);
++        if (now >= ctx->next_heartbeat) {
++            cJSON *reply = ai_control("heartbeat", "session_id", ctx->ai_session_id, 2000).json;
++            const cJSON *active = reply ? cJSON_GetObjectItemCaseSensitive(reply, "active") : NULL;
++            bool alive = cJSON_IsTrue(active);
++            cJSON_Delete(reply);
++            ctx->next_heartbeat = esp_timer_get_time() + 10000000;
++            if (!alive) { fail_closed(ctx); return; }
++        }
++    }
++    if (now >= ctx->next_query) {
++        query_webrtc(); media_sys_query();
++        if (webrtc_is_connected()) stackchan_task_diagnostics();
++        ESP_LOGI(TAG, "Media=%s heap internal=%u minimum=%u largest=%u",
++                 ctx->media == MEDIA_HUMAN ? "human" : "ai",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
++        ctx->next_query = now + 5000000;
++    }
++}
++
++static void handle_command(interaction_t *ctx, command_t command, unsigned epoch)
++{
++    if (command == COMMAND_START) {
++        ctx->idle_poll_failures = 0;
++        ctx->next_poll = 0; // An explicit retry never waits for standby backoff.
++        ctx->ai_requested = true;
++        show_phase(AI_STARTING);
++    } else if (command == COMMAND_ACCEPT) {
++        if (!ctx->call_id[0] || ctx->call_state != CALL_RINGING) return;
++        cJSON *reply = call_control(ctx, "accept").json;
++        bool ok = reply && ingest_call(ctx, reply);
++        cJSON_Delete(reply);
++        if (!ok) { fail_closed(ctx); return; }
++        ctx->next_poll = 0;
++    } else if (command == COMMAND_END) {
++        webrtc_set_uplink_enabled(false);
++        if (!poll_device(ctx)) { fail_closed(ctx); return; }
++        close_media(ctx);
++        if (!stop_ai(ctx)) { fail_closed(ctx); return; }
++        cJSON *reply = call_control(ctx, "end").json;
++        bool ok = reply && ingest_call(ctx, reply) && ctx->call_state == CALL_ENDED;
++        cJSON_Delete(reply);
++        if (!ok) { fail_closed(ctx); return; }
++        if (current(epoch)) finish_call(ctx, epoch);
++    } else if (command == COMMAND_STOP || command == COMMAND_SHUTDOWN) {
++        ctx->ai_requested = false;
++        ctx->resume_ai = false;
++        if (network_is_connected()) (void)poll_device(ctx);
++        close_media(ctx);
++        bool clean = stop_ai(ctx);
++        cJSON *reply = call_control(ctx, "end").json;
++        cJSON_Delete(reply);
++        forget_call(ctx);
++        atomic_store(&quiescent, true);
++        show_phase(clean ? IDLE : FAILED);
++    }
++}
++
++static void session_worker(void *unused)
++{
++    (void)unused;
++    interaction_t ctx = {0}; // Persistent strings reside on this PSRAM stack.
++    for (;;) {
++        portENTER_CRITICAL(&state_lock);
++        command_t command = pending_command;
++        pending_command = COMMAND_NONE;
++        unsigned epoch = atomic_load(&generation);
++        portEXIT_CRITICAL(&state_lock);
++        if (command != COMMAND_NONE) handle_command(&ctx, command, epoch);
++        if (atomic_load(&shutting_down)) { close_control(); vTaskDelay(pdMS_TO_TICKS(25)); continue; }
++        if (!current(epoch)) continue;
++        if (!network_is_connected()) {
++            close_control();
++            if (ctx.media != MEDIA_NONE || ctx.call_id[0] || ctx.ai_requested) fail_closed(&ctx);
++            vTaskDelay(pdMS_TO_TICKS(100));
++            continue;
++        }
++        if (esp_timer_get_time() >= ctx.next_poll) {
++            if (!poll_or_close(&ctx)) {
++                vTaskDelay(pdMS_TO_TICKS(25));
++                continue;
++            }
++        }
++        if (!current(epoch)) continue;
++        if (ctx.call_state == CALL_ENDED) finish_call(&ctx, epoch);
++        else if (ctx.call_state == CALL_ACCEPTING) accept_step(&ctx, epoch);
++        else if (ctx.call_state == CALL_CONNECTING || ctx.call_state == CALL_ACTIVE) human_step(&ctx, epoch);
++        else if (ctx.call_state == CALL_RINGING) {
++            show_phase(RINGING);
++            if (ctx.media == MEDIA_NONE) start_ai_when_pose_ready(&ctx, epoch);
++        } else if (ctx.ai_requested && ctx.media == MEDIA_NONE) start_ai_when_pose_ready(&ctx, epoch);
++        if (current(epoch)) monitor_media(&ctx);
++        vTaskDelay(pdMS_TO_TICKS(25));
++    }
++}
++
++int stackchan_interaction_init(void)
++{
++    if (worker) return 0;
++#ifdef CONFIG_STACKCHAN_NETWORK_DIAGNOSTICS
++    // esp-tls logs only destination/connection stages. Never enable HTTP_CLIENT
++    // DEBUG or global DEBUG: HTTP headers can contain the device bearer key.
++    esp_log_level_set("esp-tls", ESP_LOG_DEBUG);
++#endif
++    webrtc_set_uplink_enabled(false);
++    StackType_t *stack = heap_caps_malloc(WORKER_STACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (!stack) return -1;
++    worker = xTaskCreateStaticPinnedToCore(session_worker, "AI_CONTROL", WORKER_STACK_BYTES,
++                                         NULL, 4, stack, &worker_tcb, 0);
++    if (!worker) { heap_caps_free(stack); return -1; }
++    return 0;
++}
++
++void stackchan_interaction_tap(void)
++{
++    portENTER_CRITICAL(&state_lock);
++    if (atomic_load(&shutting_down)) { portEXIT_CRITICAL(&state_lock); return; }
++    phase_t p = atomic_load(&phase);
++    command_t command = COMMAND_NONE;
++    phase_t next = p;
++    if (p == IDLE || p == FAILED) { command = COMMAND_START; next = AI_STARTING; }
++    else if (p == RINGING || p == RING_STARTING) { command = COMMAND_ACCEPT; next = ACCEPTING; }
++    else if (p == ACCEPTING || p == HUMAN_CONNECTING || p == HUMAN_ACTIVE) { command = COMMAND_END; next = STOPPING; }
++    else if (p == AI_STARTING || p == AI_ACTIVE || p == RESUMING) { command = COMMAND_STOP; next = STOPPING; }
++    if (command != COMMAND_NONE) {
++        webrtc_set_uplink_enabled(false);
++        pending_command = command;
++        atomic_fetch_add(&generation, 1);
++        atomic_store(&phase, next);
++        request_phase_motion(next);
++        atomic_store(&quiescent, false);
++    }
++    portEXIT_CRITICAL(&state_lock);
++}
++
++const char *stackchan_interaction_label(void)
++{
++    switch (atomic_load(&phase)) {
++    case AI_STARTING: return "CONNECTING TAP TO CANCEL";
++    case AI_ACTIVE: return "AI ON TAP TO STOP";
++    case RING_STARTING: return "INCOMING CALL";
++    case RINGING: return "CALL TAP TO ANSWER";
++    case ACCEPTING: return "ANSWERING TAP TO END";
++    case HUMAN_CONNECTING: return "CONNECTING CALL";
++    case HUMAN_ACTIVE: return "PRIVATE CALL TAP TO END";
++    case RESUMING: return "RESUMING AI";
++    case STOPPING: return "STOPPING";
++    case FAILED: return "ERROR TAP TO RETRY";
++    default: return "TAP TO TALK";
++    }
++}
++
++void stackchan_interaction_shutdown(void)
++{
++    portENTER_CRITICAL(&state_lock);
++    atomic_store(&shutting_down, true);
++    webrtc_set_uplink_enabled(false);
++    pending_command = COMMAND_SHUTDOWN;
++    atomic_fetch_add(&generation, 1);
++    atomic_store(&phase, STOPPING);
++#ifdef CONFIG_STACKCHAN_HEAD_MOTION
++    stackchan_motion_request(STACKCHAN_MOTION_OFF);
++#endif
++    portEXIT_CRITICAL(&state_lock);
++}
++
++bool stackchan_interaction_stopped(void)
++{
++    return atomic_load(&quiescent);
++}
+diff --git a/solutions/agora_demo/main/stackchan_interaction.h b/solutions/agora_demo/main/stackchan_interaction.h
+new file mode 100644
+index 0000000..eb789fc
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_interaction.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include <stdbool.h>
++
++// All UI calls stay on app_main; the worker owns every media/session operation
++// and polls for incoming calls in standby. Tap starts/stops AI, answers ringing,
++// or ends a human call. Stop/accept taps gate outgoing audio synchronously.
++int stackchan_interaction_init(void);
++void stackchan_interaction_tap(void);
++const char *stackchan_interaction_label(void);
++void stackchan_interaction_shutdown(void);
++bool stackchan_interaction_stopped(void);
+diff --git a/solutions/agora_demo/main/stackchan_probe.c b/solutions/agora_demo/main/stackchan_probe.c
+new file mode 100644
+index 0000000..37745ee
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_probe.c
+@@ -0,0 +1,155 @@
++// Offline hardware gate: no network, Agent, NVS writes or servo commands.
++#include <math.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "freertos/semphr.h"
++#include "esp_board_manager.h"
++#include "esp_board_manager_defs.h"
++#include "esp_board_manager_includes.h"
++#include "esp_codec_dev.h"
++#include "esp_capture_audio_aec_src.h"
++#include "esp_heap_caps.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++
++#define RATE 16000
++#define SAMPLES 320
++#define BLOCKS 1000
++#ifdef CONFIG_STACKCHAN_PROBE_AEC
++#define PROBE_AEC 1
++#else
++#define PROBE_AEC 0
++#endif
++static const char *TAG = "STACKCHAN_PROBE";
++static esp_codec_dev_handle_t adc, dac;
++static SemaphoreHandle_t finished;
++static uint32_t tx_blocks, tx_errors;
++static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
++
++static void writer(void *arg)
++{
++    int32_t pcm[SAMPLES * 2];
++    for (int block = 0; block < BLOCKS; ++block) {
++        // Alternating silence and a quiet 500 Hz tone, with no microphone loopback.
++        bool tone = (block / 100) % 2;
++        for (int i = 0; i < SAMPLES; ++i) {
++            int16_t v = tone ? (int16_t)(6000 * sinf(2 * 3.14159265f * i / 32)) : 0;
++            pcm[i * 2] = pcm[i * 2 + 1] = (int32_t)v * 65536;
++        }
++        int err = esp_codec_dev_write(dac, pcm, sizeof(pcm));
++        portENTER_CRITICAL(&stats_lock);
++        if (err) ++tx_errors; else ++tx_blocks;
++        portEXIT_CRITICAL(&stats_lock);
++        if (err) break;
++    }
++    xSemaphoreGive(finished);
++    vTaskDelete(NULL);
++}
++
++void app_main(void)
++{
++    ESP_LOGI(TAG, "Offline full-duplex probe; 20 seconds; 16 kHz; AEC=%d",
++             PROBE_AEC);
++    ESP_ERROR_CHECK(esp_board_device_init(ESP_BOARD_DEVICE_NAME_AUDIO_ADC));
++    ESP_ERROR_CHECK(esp_board_device_init(ESP_BOARD_DEVICE_NAME_AUDIO_DAC));
++    dev_audio_codec_handles_t *in = NULL, *out = NULL;
++    ESP_ERROR_CHECK(esp_board_device_get_handle(ESP_BOARD_DEVICE_NAME_AUDIO_ADC, (void **)&in));
++    ESP_ERROR_CHECK(esp_board_device_get_handle(ESP_BOARD_DEVICE_NAME_AUDIO_DAC, (void **)&out));
++    assert(in && out && in->codec_dev && out->codec_dev);
++    adc = in->codec_dev;
++    dac = out->codec_dev;
++    esp_codec_dev_sample_info_t input = {.sample_rate = RATE, .bits_per_sample = 16,
++                                       // ES7210 TDM frame is 4 slots; mask selects
++                                       // three samples in FL, RE, FR wire order.
++                                       .channel = 4, .channel_mask = 7};
++    // AW88298 must be told 32-bit stereo to match the shared 64-BCLK frame.
++    esp_codec_dev_sample_info_t output = {.sample_rate = RATE, .bits_per_sample = 32,
++                                        .channel = 2};
++    ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(adc, 18));
++    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(dac, 45));
++    ESP_ERROR_CHECK(esp_codec_dev_open(adc, &input));
++    ESP_ERROR_CHECK(esp_codec_dev_open(dac, &output));
++    char layout[32] = {0};
++    ESP_ERROR_CHECK(esp_codec_dev_get_data_layout_label(adc, layout, sizeof(layout)));
++    ESP_LOGI(TAG, "Input layout=%s gain=18 dB; output volume=45", layout);
++    esp_capture_audio_src_if_t *aec = NULL;
++    int input_channels = 3;
++#if CONFIG_STACKCHAN_PROBE_AEC
++    ESP_ERROR_CHECK(esp_codec_dev_close(adc));
++    esp_capture_audio_aec_src_cfg_t cfg = {
++        .record_handle = adc, .mic_layout = "MRM", .channel = 4,
++        .channel_mask = 7, .data_on_vad = false,
++    };
++    aec = esp_capture_new_audio_aec_src(&cfg);
++    assert(aec);
++    ESP_ERROR_CHECK(aec->open(aec));
++    esp_capture_audio_info_t requested = {.format_id = ESP_CAPTURE_FMT_ID_PCM,
++        .sample_rate = RATE, .channel = 1, .bits_per_sample = 16};
++    esp_capture_audio_info_t negotiated = {0};
++    ESP_ERROR_CHECK(aec->negotiate_caps(aec, &requested, &negotiated));
++    ESP_ERROR_CHECK(aec->start(aec));
++    input_channels = 1;
++    ESP_LOGI(TAG, "AEC mono output; continuous capture; rms0 is processed PCM");
++#endif
++    finished = xSemaphoreCreateBinary();
++    assert(finished);
++    assert(xTaskCreate(writer, "probe_tx", 4096, NULL, 5, NULL) == pdPASS);
++    int16_t pcm[SAMPLES * 3];
++    uint64_t energy[3] = {0};
++    uint32_t rx_blocks = 0, rx_errors = 0, clips[3] = {0};
++    int64_t start = esp_timer_get_time();
++    for (int block = 0; block < BLOCKS; ++block) {
++        int err;
++        if (aec) {
++            esp_capture_stream_frame_t frame = {.data = (uint8_t *)pcm,
++                .size = SAMPLES * (int)sizeof(int16_t)};
++            err = aec->read_frame(aec, &frame);
++            if (frame.size != SAMPLES * sizeof(int16_t)) err = -1;
++        } else {
++            err = esp_codec_dev_read(adc, pcm, sizeof(pcm));
++        }
++        if (err) { ++rx_errors; break; }
++        ++rx_blocks;
++        for (int i = 0; i < SAMPLES; ++i) {
++            for (int c = 0; c < input_channels; ++c) {
++                int32_t v = pcm[i * input_channels + c];
++                energy[c] += (int64_t)v * v;
++                if (v >= 32760 || v <= -32760) ++clips[c];
++            }
++        }
++        if (rx_blocks % 50 == 0) {
++            uint32_t sent, errors;
++            portENTER_CRITICAL(&stats_lock);
++            sent = tx_blocks; errors = tx_errors;
++            portEXIT_CRITICAL(&stats_lock);
++            ESP_LOGI(TAG, "rx=%lu tx=%lu errors=%lu/%lu rms=%u,%u,%u clips=%lu,%lu,%lu elapsed_ms=%lld heap=%u",
++                     (unsigned long)rx_blocks, (unsigned long)sent,
++                     (unsigned long)rx_errors, (unsigned long)errors,
++                     (unsigned)sqrt((double)energy[0]/(50*SAMPLES)),
++                     (unsigned)sqrt((double)energy[1]/(50*SAMPLES)),
++                     (unsigned)sqrt((double)energy[2]/(50*SAMPLES)),
++                     (unsigned long)clips[0], (unsigned long)clips[1], (unsigned long)clips[2],
++                     (long long)(esp_timer_get_time()-start)/1000,
++                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
++            for (int c=0; c<3; ++c) { energy[c]=0; clips[c]=0; }
++        }
++    }
++    if (xSemaphoreTake(finished, pdMS_TO_TICKS(25000)) != pdTRUE) {
++        ESP_LOGE(TAG, "FAIL: playback stalled; codecs left open to avoid concurrent close");
++        return;
++    }
++    if (aec) {
++        ESP_ERROR_CHECK(aec->stop(aec));
++        ESP_ERROR_CHECK(aec->close(aec));
++        free(aec);
++    } else {
++        ESP_ERROR_CHECK(esp_codec_dev_close(adc));
++    }
++    ESP_ERROR_CHECK(esp_codec_dev_close(dac));
++    vSemaphoreDelete(finished);
++    ESP_LOGI(TAG, "DONE rx=%lu tx=%lu errors=%lu/%lu; inspect reference response before AEC",
++             (unsigned long)rx_blocks, (unsigned long)tx_blocks,
++             (unsigned long)rx_errors, (unsigned long)tx_errors);
++}
+diff --git a/solutions/agora_demo/main/stackchan_touch.c b/solutions/agora_demo/main/stackchan_touch.c
+new file mode 100644
+index 0000000..8c1930a
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_touch.c
+@@ -0,0 +1,179 @@
++/*
++ * Minimal whole-screen tap input for the verified StackChan/CoreS3 profile.
++ * Official M5Stack StackChan documentation identifies the FT6336U controller.
++ * The installed m5stack_boards 0.6.2 profile routes it through BoardManager's
++ * lcd_touch FT5x06-compatible factory on the existing i2c_master bus (0x38).
++ * Its reset/interrupt GPIOs are -1; the power dependency only deasserts the
++ * touch reset through the existing AW9523 handle, without pulsing audio rails.
++ * We deliberately do not create another bus, toggle GPIOs, or call M5.begin().
++ */
++#include "stackchan_touch.h"
++
++#include <stddef.h>
++#include "dev_lcd_touch.h"
++#include "esp_board_manager.h"
++#include "esp_lcd_touch.h"
++#include "esp_log.h"
++
++#define POLL_MS 20U
++#define MAX_POLL_GAP_MS 250U
++#define IDLE_ARM_MS 80U
++#define MIN_PRESS_MS 30U
++#define MAX_PRESS_MS 1200U
++#define RELEASE_DEBOUNCE_MS 40U
++#define TAP_COOLDOWN_MS 300U
++#define READ_RETRY_MS 1000U
++#define MAX_MOVEMENT_PX 28
++
++typedef enum {
++    WAIT_IDLE,
++    READY,
++    PRESSED,
++    RELEASING,
++} touch_state_t;
++
++static const char *TAG = "STACKCHAN_TOUCH";
++static esp_lcd_touch_handle_t touch;
++static bool attempted;
++static esp_err_t init_result = ESP_ERR_INVALID_STATE;
++static touch_state_t state;
++static bool idle_started;
++static bool polled;
++static bool error_reported;
++static bool cooldown;
++static uint32_t idle_since;
++static uint32_t pressed_since;
++static uint32_t released_since;
++static uint32_t last_poll;
++static uint32_t poll_interval = POLL_MS;
++static uint32_t last_error_log;
++static uint32_t last_tap;
++static uint16_t start_x;
++static uint16_t start_y;
++
++static void discard_gesture(void)
++{
++    state = WAIT_IDLE;
++    idle_started = false;
++}
++
++esp_err_t stackchan_touch_init(void)
++{
++    if (attempted) return init_result;
++    attempted = true;
++
++    init_result = esp_board_manager_init_device_by_name("lcd_touch");
++    if (init_result != ESP_OK) return init_result;
++
++    dev_lcd_touch_handles_t *handles = NULL;
++    init_result = esp_board_manager_get_device_handle("lcd_touch", (void **)&handles);
++    if (init_result == ESP_OK && (handles == NULL || handles->touch_handle == NULL)) {
++        init_result = ESP_ERR_INVALID_STATE;
++    }
++    if (init_result != ESP_OK) {
++        esp_err_t cleanup = esp_board_manager_deinit_device_by_name("lcd_touch");
++        if (cleanup != ESP_OK) ESP_LOGW(TAG, "Touch cleanup failed: %s", esp_err_to_name(cleanup));
++        return init_result;
++    }
++    touch = handles->touch_handle;
++    discard_gesture();
++    ESP_LOGI(TAG, "Whole-screen tap ready; release to arm, no input task");
++    return ESP_OK;
++}
++
++static bool read_failed(esp_err_t err, uint32_t now_ms)
++{
++    discard_gesture();
++    poll_interval = READ_RETRY_MS;
++    if (!error_reported || (uint32_t)(now_ms - last_error_log) >= 5000U) {
++        ESP_LOGW(TAG, "Touch read failed: %s; gesture discarded", esp_err_to_name(err));
++        last_error_log = now_ms;
++        error_reported = true;
++    }
++    return false;
++}
++
++bool stackchan_touch_take_tap(uint32_t now_ms)
++{
++    if (touch == NULL) return false;
++    if (polled && (uint32_t)(now_ms - last_poll) < poll_interval) return false;
++    if (polled && (uint32_t)(now_ms - last_poll) > MAX_POLL_GAP_MS) discard_gesture();
++    polled = true;
++    last_poll = now_ms;
++
++    esp_err_t err = esp_lcd_touch_read_data(touch);
++    if (err != ESP_OK) return read_failed(err, now_ms);
++    esp_lcd_touch_point_data_t points[2] = {0};
++    uint8_t count = 0;
++    err = esp_lcd_touch_get_data(touch, points, &count, 2);
++    if (err != ESP_OK) return read_failed(err, now_ms);
++    poll_interval = POLL_MS;
++    error_reported = false;
++
++    if (cooldown) {
++        if ((uint32_t)(now_ms - last_tap) < TAP_COOLDOWN_MS) {
++            discard_gesture();
++            return false;
++        }
++        cooldown = false;
++    }
++    if (count > 1) {
++        discard_gesture();
++        return false;
++    }
++
++    if (state == WAIT_IDLE) {
++        if (count != 0) {
++            idle_started = false;
++        } else if (!idle_started) {
++            idle_since = now_ms;
++            idle_started = true;
++        } else if ((uint32_t)(now_ms - idle_since) >= IDLE_ARM_MS) {
++            state = READY;
++        }
++        return false;
++    }
++    if (state == READY) {
++        if (count == 1) {
++            pressed_since = now_ms;
++            start_x = points[0].x;
++            start_y = points[0].y;
++            state = PRESSED;
++        }
++        return false;
++    }
++
++    uint32_t held_ms = now_ms - pressed_since;
++    if (held_ms > MAX_PRESS_MS) {
++        discard_gesture();
++        return false;
++    }
++    if (count == 1) {
++        int dx = (int)points[0].x - start_x;
++        int dy = (int)points[0].y - start_y;
++        if (dx > MAX_MOVEMENT_PX || dx < -MAX_MOVEMENT_PX ||
++            dy > MAX_MOVEMENT_PX || dy < -MAX_MOVEMENT_PX) {
++            discard_gesture();
++        } else {
++            state = PRESSED;
++        }
++        return false;
++    }
++    if (state == PRESSED) {
++        if (held_ms < MIN_PRESS_MS) {
++            discard_gesture();
++        } else {
++            state = RELEASING;
++            released_since = now_ms;
++        }
++        return false;
++    }
++    if ((uint32_t)(now_ms - released_since) >= RELEASE_DEBOUNCE_MS) {
++        discard_gesture();
++        last_tap = now_ms;
++        cooldown = true;
++        ESP_LOGI(TAG, "Screen tap released");
++        return true;
++    }
++    return false;
++}
+diff --git a/solutions/agora_demo/main/stackchan_touch.h b/solutions/agora_demo/main/stackchan_touch.h
+new file mode 100644
+index 0000000..89a8cee
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_touch.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "esp_err.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Call once after init_board(), from the same task that polls the screen.
++ * BoardManager owns the existing I2C bus, touch handle and power dependencies.
++ * This module creates no task and performs no hardware reset.
++ */
++esp_err_t stackchan_touch_init(void);
++
++/* Poll every 20–50 ms with a monotonic millisecond clock. Returns true once on
++ * release of a single-finger tap anywhere on the screen. A held startup touch,
++ * swipe, long hold, read error, or polling gap >250 ms cannot trigger a tap.
++ * All calls must use the same task; there is no event queue to replay later.
++ */
++bool stackchan_touch_take_tap(uint32_t now_ms);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/solutions/agora_demo/main/status_screen.c b/solutions/agora_demo/main/status_screen.c
+new file mode 100644
+index 0000000..006a0d6
+--- /dev/null
++++ b/solutions/agora_demo/main/status_screen.c
+@@ -0,0 +1,321 @@
++/*
++ * StackChan official neutral + blink subset; no second I2C owner or UI task.
++ * ILI9342C init commands adapted from the original pinned M5GFX 0.2.30 file
++ * src/lgfx/v1/panel/Panel_ILI9342.hpp (Panel_ILI9342, not Panel_ILI9342E).
++ * Original source: https://github.com/lovyan03/LovyanGFX/
++ * Author: lovyan03; contributors ciniml, mongonta0716, tobozo.
++ * Copyright (c) 2020 lovyan03 (https://github.com/lovyan03). All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ *    this list of conditions and the following disclaimer in the documentation
++ *    and/or other materials provided with the distribution.
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE. The views and conclusions contained in the
++ * software and documentation are those of the authors and should not be
++ * interpreted as representing official policies, either expressed or implied,
++ * of the FreeBSD Project.
++ *
++ * M5GFX distribution: Copyright (c) 2021 M5Stack, MIT License.
++ * Avatar geometry/blink: Copyright (c) 2026 M5Stack Technology CO LTD, MIT.
++ * Adapted from https://github.com/m5stack/StackChan at commit
++ * 28b9f0c8bd6acd81cb3c70f1a93c3e373b39d400:
++ * firmware/main/stackchan/avatar/skins/default/{default.cpp,eyes.cpp,mouth.cpp}
++ * firmware/main/stackchan/modifiers/blink.h
++ * This lightweight raster adapter preserves neutral geometry, eyelid clipping
++ * and blink timing; it is not the complete upstream LVGL avatar/emotion engine.
++ * Circle edge coverage uses a small local rasterizer instead of LVGL internals.
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++#include "sdkconfig.h"
++#include "status_screen.h"
++
++#if CONFIG_STACKCHAN_STATUS_SCREEN
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include "esp_attr.h"
++#include "esp_board_manager.h"
++#include "esp_board_manager_defs.h"
++#include "esp_board_manager_includes.h"
++#include "esp_heap_caps.h"
++#include "esp_lcd_ili9341.h"
++#include "esp_lcd_panel_io.h"
++#include "esp_lcd_panel_ops.h"
++#include "esp_log.h"
++#include "esp_random.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++
++#define WIDTH 320
++#define HEIGHT 240
++#define STRIP_LINES 2
++#define LABEL_MAX 26
++#define TRANSFER_TIMEOUT_MS 200
++#define EYE_SIZE 20
++#define EYE_TOP 94
++#define LABEL_TOP 196
++#define LABEL_HEIGHT 14
++
++static const char *TAG = "STATUS_SCREEN";
++static dev_display_lcd_handles_t *lcd;
++static uint16_t *strip;
++static DRAM_ATTR StaticSemaphore_t transfer_done_storage;
++static SemaphoreHandle_t transfer_done;
++static bool ready;
++static bool attempted;
++static bool scene_drawn;
++static bool eyes_closed;
++static bool blink_started;
++static uint32_t next_blink_ms;
++static char previous_label[LABEL_MAX + 1];
++
++_Static_assert(EYE_SIZE * EYE_SIZE <= WIDTH * STRIP_LINES, "Eye must fit DMA strip");
++
++// Physical unit identified by the original firmware:
++// DDh:00 CBh:14 ID4:1342 -> ILI9342C. Do not enable this module for an E panel.
++// The esp_lcd ILI9341 transport shares the required address-window operations;
++// supplying vendor_config replaces its incompatible default power/gamma table.
++static const ili9341_lcd_init_cmd_t panel_init[] = {
++    {0xc8, (const uint8_t[]){0xff, 0x93, 0x42}, 3, 0},
++    {0xc0, (const uint8_t[]){0x12, 0x12}, 2, 0},
++    {0xc1, (const uint8_t[]){0x03}, 1, 0},
++    {0xc5, (const uint8_t[]){0xf2}, 1, 0},
++    {0xb0, (const uint8_t[]){0xe0}, 1, 0},
++    {0xf6, (const uint8_t[]){0x01, 0x00, 0x00}, 3, 0},
++    {0xe0, (const uint8_t[]){0x00,0x0c,0x11,0x04,0x11,0x08,0x37,0x89,0x4c,0x06,0x0c,0x0a,0x2e,0x34,0x0f}, 15, 0},
++    {0xe1, (const uint8_t[]){0x00,0x0b,0x11,0x05,0x13,0x09,0x33,0x67,0x48,0x07,0x0e,0x0b,0x2e,0x33,0x0f}, 15, 0},
++    {0xb6, (const uint8_t[]){0x08,0x82,0x1d,0x04}, 4, 0},
++    {0x38, NULL, 0, 0},  // Idle mode off.
++    {0x29, NULL, 0, 0},  // Display on (preserves original sequence).
++    {0x11, NULL, 0, 120}, // Sleep out.
++};
++
++// Strong override of the official board package's weak factory. Board Manager
++// still creates/owns the SPI bus, panel IO, reset and AXP backlight path.
++esp_err_t lcd_panel_factory_entry_t(esp_lcd_panel_io_handle_t io,
++                                  const esp_lcd_panel_dev_config_t *config,
++                                  esp_lcd_panel_handle_t *out)
++{
++    static const ili9341_vendor_config_t vendor = {
++        .init_cmds = panel_init,
++        .init_cmds_size = sizeof(panel_init) / sizeof(panel_init[0]),
++    };
++    esp_lcd_panel_dev_config_t panel_config = *config;
++    panel_config.vendor_config = (void *)&vendor;
++    ESP_LOGI(TAG, "Using verified StackChan ILI9342C initialization");
++    return esp_lcd_new_panel_ili9341(io, &panel_config, out);
++}
++
++static bool IRAM_ATTR on_transfer_done(esp_lcd_panel_io_handle_t io,
++                                     esp_lcd_panel_io_event_data_t *event, void *ctx)
++{
++    (void)io;
++    (void)event;
++    BaseType_t wake = pdFALSE;
++    xSemaphoreGiveFromISR((SemaphoreHandle_t)ctx, &wake);
++    return wake == pdTRUE;
++}
++
++// Hand-defined 5x7 uppercase glyph rows; no external font runtime or assets.
++static const uint8_t font[26][7] = {
++    {14,17,17,31,17,17,17}, {30,17,17,30,17,17,30},
++    {14,17,16,16,16,17,14}, {30,17,17,17,17,17,30},
++    {31,16,16,30,16,16,31}, {31,16,16,30,16,16,16},
++    {14,17,16,23,17,17,14}, {17,17,17,31,17,17,17},
++    {14,4,4,4,4,4,14}, {7,2,2,2,2,18,12},
++    {17,18,20,24,20,18,17}, {16,16,16,16,16,16,31},
++    {17,27,21,21,17,17,17}, {17,25,21,19,17,17,17},
++    {14,17,17,17,17,17,14}, {30,17,17,30,16,16,16},
++    {14,17,17,17,21,18,13}, {30,17,17,30,20,18,17},
++    {15,16,16,14,1,1,30}, {31,4,4,4,4,4,4},
++    {17,17,17,17,17,17,14}, {17,17,17,17,17,10,4},
++    {17,17,17,21,21,21,10}, {17,17,10,4,10,17,17},
++    {17,17,10,4,4,4,4}, {31,1,2,4,8,16,31},
++};
++
++static bool text_pixel(const char *text, int top, int scale, int x, int y)
++{
++    if (y < top || y >= top + 7 * scale) return false;
++    int length = (int)strlen(text);
++    int left = (WIDTH - (length * 6 - 1) * scale) / 2;
++    if (x < left || x >= left + length * 6 * scale) return false;
++    int gx = (x - left) / scale;
++    int col = gx % 6;
++    unsigned char ch = (unsigned char)text[gx / 6];
++    if (col >= 5 || ch < 'A' || ch > 'Z') return false;
++    return (font[ch - 'A'][(y - top) / scale] & (1 << (4 - col))) != 0;
++}
++
++static uint16_t wire_color(uint16_t rgb565)
++{
++    // esp_lcd streams these bytes as-is: RGB565 needs most-significant byte first.
++    return (rgb565 << 8) | (rgb565 >> 8);
++}
++
++static uint16_t eye_pixel(int x, int y)
++{
++    // Upstream setSize(0) maps 8..32 to 20px. setWeight(25) moves a 20px
++    // black eyelid up 5px, covering the top 15 rows of the circle.
++    if (eyes_closed && y < 15) return 0;
++    unsigned covered = 0;
++    for (int sy = 0; sy < 4; ++sy) {
++        for (int sx = 0; sx < 4; ++sx) {
++            int dx = x * 8 + sx * 2 + 1 - 80;
++            int dy = y * 8 + sy * 2 + 1 - 80;
++            covered += dx * dx + dy * dy <= 80 * 80;
++        }
++    }
++    unsigned r = (covered * 31 + 8) / 16;
++    unsigned g = (covered * 63 + 8) / 16;
++    return (r << 11) | (g << 5) | r;
++}
++
++static uint16_t face_pixel(int x, int y)
++{
++    if (x >= 115 && x < 205 && y >= 143 && y < 149) return 0xffff;
++    if (y >= EYE_TOP && y < EYE_TOP + EYE_SIZE) {
++        if (x >= 80 && x < 100) return eye_pixel(x - 80, y - EYE_TOP);
++        if (x >= 220 && x < 240) return eye_pixel(x - 220, y - EYE_TOP);
++    }
++    return 0;
++}
++
++static bool submit_pixels(int left, int top, int width, int height)
++{
++    // Exactly one transfer at a time, so callback ownership is unambiguous.
++    esp_err_t err = esp_lcd_panel_draw_bitmap(lcd->panel_handle, left, top,
++                                             left + width, top + height, strip);
++    if (err != ESP_OK ||
++        xSemaphoreTake(transfer_done, pdMS_TO_TICKS(TRANSFER_TIMEOUT_MS)) != pdTRUE) {
++        ready = false;
++        // No free/reuse on error: a late DMA completion may still use strip.
++        ESP_LOGE(TAG, "LCD transfer failed (%s); updates disabled, DMA buffer retained",
++                 esp_err_to_name(err == ESP_OK ? ESP_ERR_TIMEOUT : err));
++        return false;
++    }
++    return true;
++}
++
++void stackchan_status_show(const char *label)
++{
++    if (!ready || label == NULL) return;
++    const char *visible = (strcmp(label, "READY") == 0 || strcmp(label, "RTC READY") == 0) ? "" : label;
++    char current[LABEL_MAX + 1];
++    size_t n = strnlen(visible, LABEL_MAX);
++    for (size_t i = 0; i < n; ++i) {
++        char ch = visible[i];
++        current[i] = (ch >= 'A' && ch <= 'Z') || ch == ' ' ? ch : ' ';
++    }
++    current[n] = '\0';
++    if (scene_drawn && strcmp(previous_label, current) == 0) return;
++
++    // Full screen is painted only once. Subsequent status changes touch the
++    // bottom label band; READY clears it to leave the original pure face.
++    int first = scene_drawn ? LABEL_TOP : 0;
++    int last = scene_drawn ? LABEL_TOP + LABEL_HEIGHT : HEIGHT;
++    for (int top = first; top < last; top += STRIP_LINES) {
++        for (int row = 0; row < STRIP_LINES; ++row) {
++            int y = top + row;
++            for (int x = 0; x < WIDTH; ++x) {
++                uint16_t color = face_pixel(x, y);
++                if (text_pixel(current, LABEL_TOP, 2, x, y)) color = 0x8c71;
++                strip[row * WIDTH + x] = wire_color(color);
++            }
++        }
++        if (!submit_pixels(0, top, WIDTH, STRIP_LINES)) return;
++    }
++    scene_drawn = true;
++    memcpy(previous_label, current, n + 1);
++    ESP_LOGI(TAG, "State: %s", label);
++}
++
++void stackchan_status_tick(uint32_t now_ms)
++{
++    if (!ready || !scene_drawn) return;
++    if (!blink_started) {
++        blink_started = true;
++        next_blink_ms = now_ms + 5200;
++        return;
++    }
++    // Signed modular subtraction also handles the millis counter wrapping.
++    if ((int32_t)(now_ms - next_blink_ms) < 0) return;
++    eyes_closed = !eyes_closed;
++    next_blink_ms = now_ms + (eyes_closed ? 200 : 5200 + esp_random() % 501);
++    for (int eye = 0; eye < 2; ++eye) {
++        for (int y = 0; y < EYE_SIZE; ++y) {
++            for (int x = 0; x < EYE_SIZE; ++x) {
++                strip[y * EYE_SIZE + x] = wire_color(eye_pixel(x, y));
++            }
++        }
++        // 20x20x2 = 800 bytes, one complete eye per transaction (two total).
++        if (!submit_pixels(eye == 0 ? 80 : 220, EYE_TOP, EYE_SIZE, EYE_SIZE)) return;
++    }
++}
++
++int stackchan_status_init(void)
++{
++    if (attempted) return ready ? ESP_OK : ESP_ERR_INVALID_STATE;
++    attempted = true;
++    strip = heap_caps_malloc(WIDTH * STRIP_LINES * sizeof(*strip),
++                             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
++    if (strip == NULL) return ESP_ERR_NO_MEM;
++    transfer_done = xSemaphoreCreateBinaryStatic(&transfer_done_storage);
++    esp_err_t err = esp_board_device_init(ESP_BOARD_DEVICE_NAME_DISPLAY_LCD);
++    bool device_initialized = err == ESP_OK;
++    if (err == ESP_OK) {
++        err = esp_board_device_get_handle(ESP_BOARD_DEVICE_NAME_DISPLAY_LCD, (void **)&lcd);
++    }
++    if (err == ESP_OK && (lcd == NULL || lcd->panel_handle == NULL || lcd->io_handle == NULL)) {
++        err = ESP_ERR_INVALID_STATE;
++    }
++    if (err == ESP_OK) {
++        const esp_lcd_panel_io_callbacks_t callbacks = {.on_color_trans_done = on_transfer_done};
++        err = esp_lcd_panel_io_register_event_callbacks(lcd->io_handle, &callbacks, transfer_done);
++    }
++    if (err != ESP_OK) {
++        // No pixels were submitted, so freeing this buffer cannot race DMA.
++        if (device_initialized) {
++            esp_err_t cleanup = esp_board_device_deinit(ESP_BOARD_DEVICE_NAME_DISPLAY_LCD);
++            if (cleanup != ESP_OK) ESP_LOGW(TAG, "LCD cleanup failed: %s", esp_err_to_name(cleanup));
++        }
++        lcd = NULL;
++        heap_caps_free(strip);
++        strip = NULL;
++        ESP_LOGE(TAG, "LCD initialization failed: %s; continuing headless", esp_err_to_name(err));
++        return err;
++    }
++    ready = true;
++    stackchan_status_show("STARTING");
++    if (!ready) return ESP_FAIL;
++    ESP_LOGI(TAG, "ILI9342C 320x240, DMA strip=%u bytes; no display task",
++             (unsigned)(WIDTH * STRIP_LINES * sizeof(*strip)));
++    return ESP_OK;
++}
++#endif
+diff --git a/solutions/agora_demo/main/status_screen.h b/solutions/agora_demo/main/status_screen.h
+new file mode 100644
+index 0000000..2be793a
+--- /dev/null
++++ b/solutions/agora_demo/main/status_screen.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Official DefaultAvatar neutral + blink subset for the identified ILI9342C.
++// Call init after init_board(), before starting media. All functions must be
++// called from the same application task, never an audio/RTC callback or ISR.
++// init returns ESP_OK or an ESP error. On failure audio may continue headless.
++int stackchan_status_init(void);
++// Uppercase ASCII labels, maximum 26 characters. READY/RTC READY show the pure
++// official face without a label. Only changed label pixels redraw after init.
++// A transfer timeout permanently disables display updates until reboot, keeping
++// its DMA buffer alive so a late completion cannot access freed/reused memory.
++void stackchan_status_show(const char *label);
++// Call from the same task about every 100 ms. Each blink transition submits
++// exactly two 20x20 eye rectangles; no additional framebuffer or task.
++void stackchan_status_tick(uint32_t now_ms);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/solutions/agora_demo/main/task_diagnostics.c b/solutions/agora_demo/main/task_diagnostics.c
+new file mode 100644
+index 0000000..f820b99
+--- /dev/null
++++ b/solutions/agora_demo/main/task_diagnostics.c
+@@ -0,0 +1,87 @@
++#include "task_diagnostics.h"
++#include "sdkconfig.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++
++#if defined(CONFIG_STACKCHAN_MEDIA_DIAGNOSTICS) && configUSE_TRACE_FACILITY && configGENERATE_RUN_TIME_STATS
++#include <stdbool.h>
++#include <stdint.h>
++#include "esp_heap_caps.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++
++static const char *TAG = "TASK_DIAG";
++static const char *const names[] = {
++    "aenc_0", "buffer_in", "AUD_SRC", "Adec", "ARender", "pc_task", "pc_send", "AI_CONTROL",
++};
++#define TASK_COUNT (sizeof(names) / sizeof(names[0]))
++
++typedef struct {
++    TaskStatus_t status;
++    TaskHandle_t handle;
++    UBaseType_t number;
++    configRUN_TIME_COUNTER_TYPE runtime;
++    int64_t observed_us;
++    uint32_t stack_free_bytes;
++    bool seen;
++} observation_t;
++
++void stackchan_task_diagnostics(void)
++{
++    static observation_t *observations;
++    static bool unavailable;
++    if (unavailable) return;
++    if (!observations) {
++        observations = heap_caps_calloc(TASK_COUNT, sizeof(*observations),
++                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++        if (!observations) {
++            unavailable = true;
++            ESP_LOGW(TAG, "Task diagnostics unavailable: no external scratch memory");
++            return;
++        }
++        ESP_LOGI(TAG, "CPU scale: 1000 permille=one core; dual-core sum may reach 2000; stack sampled once per task");
++    }
++    for (unsigned i = 0; i < TASK_COUNT; ++i) {
++        observation_t *previous = &observations[i];
++        TaskHandle_t handle = xTaskGetHandle(names[i]);
++        if (!handle) {
++            previous->seen = false;
++            ESP_LOGI(TAG, "TASK name=%s present=0", names[i]);
++            continue;
++        }
++        // Avoid uxTaskGetSystemState: that API scans every stack under the
++        // kernel lock. This query does not scan, and the separate one-time
++        // watermark scan below is preemptible in the low-priority caller.
++        vTaskGetInfo(handle, &previous->status, pdFALSE, eInvalid);
++        int64_t now = esp_timer_get_time();
++        TaskStatus_t *status = &previous->status;
++        bool same = previous->seen && previous->handle == handle &&
++                    previous->number == status->xTaskNumber;
++        int cpu_permille = -1; // First observation or a recreated task: baseline only.
++#ifdef CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
++        if (same && now > previous->observed_us) {
++            configRUN_TIME_COUNTER_TYPE used = status->ulRunTimeCounter - previous->runtime;
++            cpu_permille = (int)((uint64_t)used * 1000 / (uint64_t)(now - previous->observed_us));
++        }
++#endif
++        if (!same) {
++            previous->stack_free_bytes =
++                (uint32_t)uxTaskGetStackHighWaterMark(handle) * sizeof(StackType_t);
++        }
++        int core = -1;
++#if configTASKLIST_INCLUDE_COREID
++        core = status->xCoreID;
++#endif
++        ESP_LOGI(TAG, "TASK name=%s cpu_one_core_permille=%d priority=%u core=%d stack_free_bytes_once=%lu",
++                 names[i], cpu_permille, (unsigned)status->uxCurrentPriority, core,
++                 (unsigned long)previous->stack_free_bytes);
++        previous->handle = handle;
++        previous->number = status->xTaskNumber;
++        previous->runtime = status->ulRunTimeCounter;
++        previous->observed_us = now;
++        previous->seen = true;
++    }
++}
++#else
++void stackchan_task_diagnostics(void) {}
++#endif
+diff --git a/solutions/agora_demo/main/task_diagnostics.h b/solutions/agora_demo/main/task_diagnostics.h
+new file mode 100644
+index 0000000..7263274
+--- /dev/null
++++ b/solutions/agora_demo/main/task_diagnostics.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++// Optional numeric-only diagnostics. Call from the single media lifecycle owner
++// approximately every five seconds while connected, outside start/stop handling.
++// Never call concurrently with task teardown. The selected tasks' stack margins
++// are sampled once per task instance; CPU is relative to one core (1000 permille).
++// No-op unless CONFIG_STACKCHAN_MEDIA_DIAGNOSTICS and FreeRTOS tracing are enabled.
++void stackchan_task_diagnostics(void);
+diff --git a/solutions/agora_demo/main/webrtc.c b/solutions/agora_demo/main/webrtc.c
+index 8c7e480..fbd64f2 100644
+--- a/solutions/agora_demo/main/webrtc.c
++++ b/solutions/agora_demo/main/webrtc.c
+@@ -2,6 +2,7 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <stdatomic.h>
+ 
+ #include "agora_signaling.h"
+ #include "esp_log.h"
+@@ -16,6 +17,18 @@ static esp_webrtc_handle_t webrtc;
+ static volatile bool connected;
+ static volatile bool restart_required = true;
+ static int64_t connect_started_us;
++static atomic_bool uplink_allowed = true;
++
++void webrtc_set_uplink_enabled(bool enabled)
++{
++    atomic_store(&uplink_allowed, enabled);
++}
++
++static bool allow_audio_send(const esp_peer_audio_frame_t *frame, void *ctx)
++{
++    (void)frame; (void)ctx;
++    return atomic_load(&uplink_allowed);
++}
+ 
+ static int webrtc_event_handler(esp_webrtc_event_t *event, void *ctx)
+ {
+@@ -89,6 +102,7 @@ int start_webrtc(const char *url, const char *token)
+             .audio_dir = ESP_PEER_MEDIA_DIR_SEND_RECV,
+             .video_dir = ESP_PEER_MEDIA_DIR_NONE,
+             .no_auto_reconnect = true,
++            .on_audio_send = allow_audio_send,
+             .extra_cfg = &peer_cfg,
+             .extra_size = sizeof(peer_cfg),
+         },
+@@ -155,6 +169,11 @@ bool webrtc_needs_restart(void)
+     return false;
+ }
+ 
++bool webrtc_is_connected(void)
++{
++    return connected;
++}
++
+ int stop_webrtc(void)
+ {
+     if (webrtc != NULL) {
+diff --git a/solutions/agora_demo/partitions.csv b/solutions/agora_demo/partitions.csv
+index 7ddfcae..c0ce854 100644
+--- a/solutions/agora_demo/partitions.csv
++++ b/solutions/agora_demo/partitions.csv
+@@ -1,4 +1,8 @@
+-# Name,   Type, SubType, Offset,  Size, Flags
+-nvs,      data, nvs,     0xa000,  0x5000,
+-phy_init, data, phy,     0xf000,  0x1000,
+-factory,  app,  factory, 0x10000, 0x380000,
++# Matches backed-up whale partition table. Never flash this table.
++nvs,data,nvs,0x9000,0x4000
++otadata,data,ota,0xd000,0x2000
++phy_init,data,phy,0xf000,0x1000
++ota_0,app,ota_0,0x20000,0x4f0000
++ota_1,app,ota_1,0x510000,0x4f0000
++assets,data,spiffs,0xa00000,0x400000
++coredump,data,coredump,0xe00000,0x10000
+diff --git a/solutions/agora_demo/sdkconfig.defaults b/solutions/agora_demo/sdkconfig.defaults
+index c5521d7..feaf110 100644
+--- a/solutions/agora_demo/sdkconfig.defaults
++++ b/solutions/agora_demo/sdkconfig.defaults
+@@ -1,4 +1,5 @@
+ # Runtime and external RAM
++CONFIG_COMPILER_OPTIMIZATION_PERF=y
+ CONFIG_SPIRAM=y
+ CONFIG_ESP_SYSTEM_PANIC_GDBSTUB=y
+ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+@@ -14,6 +15,7 @@ CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+ CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+ CONFIG_MBEDTLS_SSL_DTLS_SRTP=y
+ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
++CONFIG_MBEDTLS_HAVE_TIME_DATE=y
+ 
+ # Allocate large networking buffers in external RAM
+ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
+@@ -28,3 +30,12 @@ CONFIG_AUDIO_DECODER_OPUS_SUPPORT=y
+ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+ CONFIG_PARTITION_TABLE_CUSTOM=y
+ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
++CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
++CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
++CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
++CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
++CONFIG_STACKCHAN_AUDIO_PROBE=y
++
++CONFIG_MBEDTLS_X509_CRT_WRITE_C=y
++
++CONFIG_MBEDTLS_X509_CREATE_C=y
+diff --git a/solutions/agora_demo/sdkconfig.defaults.esp32s3 b/solutions/agora_demo/sdkconfig.defaults.esp32s3
+index 780f487..90deb2c 100644
+--- a/solutions/agora_demo/sdkconfig.defaults.esp32s3
++++ b/solutions/agora_demo/sdkconfig.defaults.esp32s3
+@@ -1,11 +1,5 @@
+-CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+-CONFIG_SPI_FLASH_HPM_ENA=y
+-CONFIG_SPI_FLASH_HPM_DC_ON=y
+-CONFIG_BOOTLOADER_FLASH_DC_AWARE=y
+-
+-CONFIG_SPIRAM_MODE_OCT=y
+-CONFIG_SPIRAM_SPEED_120M=y
++CONFIG_SPIRAM_MODE_QUAD=y
++CONFIG_SPIRAM_SPEED_80M=y
+ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+ CONFIG_ESP32S3_DATA_CACHE_64KB=y
+diff --git a/solutions/agora_demo/main/LICENSE.motion b/solutions/agora_demo/main/LICENSE.motion
+new file mode 100644
+index 0000000..80b092d
+--- /dev/null
++++ b/solutions/agora_demo/main/LICENSE.motion
+@@ -0,0 +1,23 @@
++MIT License
++
++Copyright (c) 2021 M5Stack
++Copyright (c) 2026 M5Stack Technology CO LTD
++Copyright (c) 2024 ftservo
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/solutions/agora_demo/main/stackchan_motion.c b/solutions/agora_demo/main/stackchan_motion.c
+new file mode 100644
+index 0000000..e18c3ca
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_motion.c
+@@ -0,0 +1,395 @@
++/*
++ * SPDX-License-Identifier: MIT
++ * Adapted protocol/power details: Copyright (c) 2021 M5Stack,
++ * Copyright (c) 2026 M5Stack Technology CO LTD, Copyright (c) 2024 ftservo.
++ * See LICENSE.motion for the retained upstream license notices.
++ *
++ * Optional, bounded head motion for the existing StackChan. Protocol/pins:
++ * https://docs.m5stack.com/en/StackChan/
++ * M5Stack StackChan-BSP M5StackChan.cpp (UART1/6/7, PY32 VM_EN), and the
++ * previously validated whale_motion.cpp / SCS.cpp whole-frame UART fix.
++ * Only the existing calibrated position mode is accepted; never write EEPROM.
++ */
++#include "stackchan_motion.h"
++#include <stdatomic.h>
++
++#ifndef CONFIG_STACKCHAN_HEAD_MOTION
++esp_err_t stackchan_motion_init(void) { return ESP_OK; }
++void stackchan_motion_request(stackchan_motion_pose_t pose) { (void)pose; }
++bool stackchan_motion_settled(void) { return true; }
++#else
++#include "stackchan_motion_math.h"
++#include <string.h>
++#include "driver/i2c_master.h"
++#include "driver/uart.h"
++#include "esp_board_manager.h"
++#include "esp_heap_caps.h"
++#include "esp_io_expander.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "nvs.h"
++#include "nvs_flash.h"
++
++#define MOTION_UART UART_NUM_1
++#define IO_MS 100
++#define STACK_BYTES 4096
++#define POSE_TIMEOUT_US 20000000LL
++static const char *TAG = "STACKCHAN_MOTION";
++// Low two bits are pose, upper bits revision. Identical requests are idempotent.
++static atomic_uint desired = STACKCHAN_MOTION_HOLD;
++static atomic_uint completed = UINT32_MAX;
++static atomic_bool available;
++static i2c_master_dev_handle_t py32;
++static bool uart_ready, uart_installed, attempted;
++static int zero[2];
++static StaticTask_t worker_tcb;
++
++void stackchan_motion_request(stackchan_motion_pose_t pose)
++{
++    if ((unsigned)pose > STACKCHAN_MOTION_OFF) return;
++    unsigned old = atomic_load(&desired);
++    while ((old & 3u) != (unsigned)pose && (old & 3u) != STACKCHAN_MOTION_OFF) {
++        unsigned next = ((old + 4u) & ~3u) | (unsigned)pose;
++        if (atomic_compare_exchange_weak(&desired, &old, next)) return;
++    }
++}
++
++bool stackchan_motion_settled(void)
++{
++    return !atomic_load(&available) || atomic_load(&desired) == atomic_load(&completed);
++}
++
++static bool read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *value, size_t size)
++{
++    return i2c_master_transmit_receive(dev, &reg, 1, value, size, IO_MS) == ESP_OK;
++}
++
++static bool py_bit(uint8_t reg, bool on)
++{
++    uint8_t bytes[2] = {reg, 0};
++    if (!read_reg(py32, reg, &bytes[1], 1)) return false;
++    bytes[1] = on ? bytes[1] | 1u : bytes[1] & ~1u;
++    if (i2c_master_transmit(py32, bytes, 2, IO_MS) != ESP_OK) return false;
++    uint8_t verify;
++    return read_reg(py32, reg, &verify, 1) && verify == bytes[1];
++}
++
++static bool servo_transaction(uint8_t id, uint8_t instruction, uint8_t reg,
++                              const uint8_t *data, size_t size, uint8_t *out, size_t count)
++{
++    uint8_t frame[13], response[21] = {0};
++    size_t length = motion_packet(frame, id, instruction, reg, data, size);
++    if (!uart_ready || !length || count > 15) {
++        ESP_LOGE(TAG, "Servo local rejection id=%u op=%u reg=%u count=%u ready=%d",
++                 id, instruction, reg, (unsigned)count, uart_ready);
++        return false;
++    }
++    esp_err_t flushed = uart_flush_input(MOTION_UART);
++    int written = flushed == ESP_OK ? uart_write_bytes(MOTION_UART, frame, length) : -1;
++    esp_err_t drained = written == (int)length ? uart_wait_tx_done(MOTION_UART, pdMS_TO_TICKS(IO_MS)) : ESP_FAIL;
++    if (flushed != ESP_OK || written != (int)length || drained != ESP_OK) {
++        ESP_LOGE(TAG, "Servo TX failed id=%u op=%u reg=%u count=%u flush=%d written=%d frame=%u drain=%d",
++                 id, instruction, reg, (unsigned)count, flushed, written, (unsigned)length, drained);
++        return false;
++    }
++    // At the production 100 Hz tick rate, pdMS_TO_TICKS(5) is zero. Always
++    // yield while waiting, without extending the absolute response deadline.
++    const TickType_t wait_ticks = pdMS_TO_TICKS(5) ? pdMS_TO_TICKS(5) : 1;
++    const int64_t tick_us = 1000000LL / configTICK_RATE_HZ;
++    int64_t started = esp_timer_get_time(), end = started + IO_MS * 1000LL;
++    size_t received = 0;
++    while (received < count + 6) {
++        int64_t remaining = end - esp_timer_get_time();
++        // Do not start another blocking wait if less than one tick remains.
++        if (remaining < tick_us) break;
++        TickType_t ticks = (TickType_t)(remaining / tick_us);
++        if (ticks > wait_ticks) ticks = wait_ticks;
++        uint8_t byte;
++        if (uart_read_bytes(MOTION_UART, &byte, 1, ticks) != 1) continue;
++        if (received < 2 && byte != 0xff) { received = 0; continue; }
++        response[received++] = byte;
++    }
++    // A higher-priority task may have delayed us while this same response was
++    // already queued. Take only one bounded snapshot; never wait or resend the
++    // request after its deadline. A late reply cannot be mistaken for a retry.
++    size_t buffered = 0, supplemented = 0;
++    if (received < count + 6 && uart_get_buffered_data_len(MOTION_UART, &buffered) == ESP_OK) {
++        size_t budget = count + 6 - received;
++        if (budget > buffered) budget = buffered;
++        while (supplemented < budget && received < count + 6) {
++            uint8_t byte;
++            if (uart_read_bytes(MOTION_UART, &byte, 1, 0) != 1) break;
++            ++supplemented;
++            if (received < 2 && byte != 0xff) { received = 0; continue; }
++            response[received++] = byte;
++        }
++    }
++    if (!motion_response(response, received, id, count)) {
++        // Numeric motor protocol only. Startup retries are bounded; steady-state
++        // failure disables motion, so this cannot log on every healthy 100ms tick.
++        unsigned wire_sum = 0;
++        for (size_t i = 2; i < received; ++i) wire_sum += response[i];
++        ESP_LOGE(TAG, "Servo RX rejected id=%u op=%u reg=%u count=%u got=%u expected=%u status_received=%u status=%u first=%02x,%02x,%02x,%02x,%02x,%02x tail=%02x sum=%02x elapsed_ms=%lld buffered=%u supplemented=%u",
++                 id, instruction, reg, (unsigned)count, (unsigned)received, (unsigned)(count + 6),
++                 received >= 5, response[4], response[0], response[1], response[2], response[3], response[4], response[5],
++                 received ? response[received-1] : 0, wire_sum & 255u,
++                 (long long)((esp_timer_get_time() - started) / 1000), (unsigned)buffered, (unsigned)supplemented);
++        return false;
++    }
++    if (supplemented) ESP_LOGI(TAG, "Servo RX buffered completion id=%u op=%u reg=%u count=%u elapsed_ms=%lld buffered=%u supplemented=%u",
++                              id, instruction, reg, (unsigned)count,
++                              (long long)((esp_timer_get_time() - started) / 1000), (unsigned)buffered, (unsigned)supplemented);
++    if (count) memcpy(out, response + 5, count);
++    return true;
++}
++
++static bool servo_read(uint8_t id, uint8_t reg, uint8_t *out, uint8_t count)
++{
++    return servo_transaction(id, 2, reg, &count, 1, out, count);
++}
++
++static bool servo_torque(uint8_t id, bool on)
++{
++    uint8_t value = on;
++    return servo_transaction(id, 3, 40, &value, 1, NULL, 0);
++}
++
++static bool servo_position(uint8_t id, int position)
++{
++    if (position < 0 || position > 1000) return false;
++    uint8_t data[] = {(uint8_t)(position >> 8), (uint8_t)position, 0, 100, 0, 40};
++    return servo_transaction(id, 3, 42, data, 6, NULL, 0);
++}
++
++static void release_motion(void)
++{
++    // Stop further targets before bounded best-effort torque/power shutdown.
++    atomic_store(&available, false);
++    if (uart_ready) { (void)servo_torque(1, false); (void)servo_torque(2, false); }
++    if (py32) {
++        bool off = false;
++        for (int i = 0; i < 3 && !off; ++i) off = py_bit(0x05, false);
++        if (off) ESP_LOGI(TAG, "Motor power shutdown confirmed vm_en=0");
++        else ESP_LOGE(TAG, "VM_EN shutdown could not be confirmed");
++    }
++    // Never disable global BUS/BOOST rails: shared audio/display remain powered.
++}
++
++static bool configure_external_power(i2c_master_bus_handle_t bus)
++{
++    esp_io_expander_handle_t *owner = NULL;
++    if (esp_board_manager_get_device_handle("gpio_expander", (void **)&owner) != ESP_OK ||
++        !owner || !*owner) return false;
++    uint32_t outputs;
++    if ((*owner)->read_output_reg(*owner, &outputs) != ESP_OK) return false;
++    i2c_master_dev_handle_t axp = NULL;
++    const i2c_device_config_t cfg = {.dev_addr_length = I2C_ADDR_BIT_LEN_7,
++                                    .device_address = 0x34, .scl_speed_hz = 400000};
++    if (i2c_master_bus_add_device(bus, &cfg, &axp) != ESP_OK) return false;
++    uint8_t status, ts[2];
++    bool safe = read_reg(axp, 0x00, &status, 1);
++    int raw = -1;
++    if (safe && !(status & 0x08) && (status & 0x20) && !(outputs & (1u << 1))) {
++        safe = read_reg(axp, 0x36, ts, 2);
++        if (safe) raw = ((ts[0] & 0x3f) << 8) | ts[1];
++    }
++    safe = safe && motion_supply_safe(status, outputs, raw);
++    (void)i2c_master_bus_rm_device(axp);
++    if (!safe) return false;
++    // Startup only, while no concurrent BoardManager consumer changes outputs.
++    // Use the existing driver so its cached latch/direction remain consistent.
++    // Enable BOOST first, then BUS_OUT; all unrelated bits are preserved.
++    return esp_io_expander_set_dir(*owner, (1u << 15) | (1u << 1), IO_EXPANDER_OUTPUT) == ESP_OK &&
++           esp_io_expander_set_level(*owner, 1u << 15, 1) == ESP_OK &&
++           esp_io_expander_set_level(*owner, 1u << 1, 1) == ESP_OK;
++}
++
++static bool feedback(uint8_t id, int *position, bool *moving)
++{
++    uint8_t data[15];
++    if (!servo_read(id, 56, data, sizeof(data))) return false;
++    *position = motion_word(data);
++    *moving = data[10] != 0;
++    bool valid = *position <= 1000 && data[7] <= 60 && motion_abs(motion_load(data + 4)) <= 650;
++    if (!valid) ESP_LOGE(TAG, "Servo feedback rejected id=%u position=%d temperature=%u load=%d moving=%u",
++                        id, *position, data[7], motion_load(data + 4), data[10]);
++    return valid;
++}
++
++static void motion_worker(void *unused)
++{
++    (void)unused;
++    int position[2], commanded[2], previous[2], stalls[2] = {0};
++    bool moving[2];
++    const char *stage = "startup_wait";
++    unsigned fault_id = 0;
++    // The existing physical servos required 1.5 s after VM_EN, not 200 ms.
++    for (int i = 0; i < 30; ++i) {
++        if ((atomic_load(&desired) & 3u) == STACKCHAN_MOTION_OFF) goto done;
++        vTaskDelay(pdMS_TO_TICKS(50));
++    }
++    for (int axis = 0; axis < 2; ++axis) {
++        uint8_t id = axis + 1, limits[4], model[2];
++        fault_id = id; stage = "torque_off";
++        if (!servo_torque(id, false)) goto fault;
++        stage = "startup_feedback";
++        bool got = false;
++        for (int retry = 0; retry < 5 && !got; ++retry) {
++            if ((atomic_load(&desired) & 3u) == STACKCHAN_MOTION_OFF) goto done;
++            got = feedback(id, &position[axis], &moving[axis]);
++            if (!got) vTaskDelay(pdMS_TO_TICKS(100));
++        }
++        if (!got) goto fault;
++        stage = "model";
++        if (!servo_read(id, 3, model, sizeof(model))) goto fault;
++        ESP_LOGI(TAG, "Servo startup id=%u model=%d position=%d", id, motion_word(model), position[axis]);
++        if (motion_word(model) != 1284) goto fault;
++        stage = "limits";
++        if (!servo_read(id, 9, limits, sizeof(limits))) goto fault;
++        ESP_LOGI(TAG, "Servo startup limits id=%u min=%d max=%d zero=%d", id,
++                 motion_word(limits), motion_word(limits+2), zero[axis]);
++        if (!motion_start_valid(axis, position[axis], zero[axis], motion_word(limits), motion_word(limits+2))) goto fault;
++        commanded[axis] = previous[axis] = position[axis];
++    }
++    for (int axis = 0; axis < 2; ++axis) {
++        if ((atomic_load(&desired) & 3u) == STACKCHAN_MOTION_OFF) goto done;
++        fault_id = axis + 1; stage = "seed_position";
++        if (!servo_position(axis + 1, position[axis])) goto fault;
++        if ((atomic_load(&desired) & 3u) == STACKCHAN_MOTION_OFF) goto done;
++        stage = "torque_enable";
++        if (!servo_torque(axis + 1, true)) goto fault;
++    }
++    unsigned ticket = UINT32_MAX;
++    unsigned quiet = 0;
++    int target = commanded[1];
++    int64_t deadline = 0;
++    for (;;) {
++        // Every path (including canceled I/O) yields before another slew step.
++        vTaskDelay(pdMS_TO_TICKS(100));
++        unsigned next_ticket = atomic_load(&desired);
++        stackchan_motion_pose_t pose = next_ticket & 3u;
++        if (pose == STACKCHAN_MOTION_OFF) goto done;
++        for (int axis = 0; axis < 2; ++axis) {
++            fault_id = axis + 1; stage = "active_feedback";
++            if (!feedback(axis + 1, &position[axis], &moving[axis])) goto fault;
++            if (motion_abs(commanded[axis] - position[axis]) > 15 &&
++                motion_abs(position[axis] - previous[axis]) <= 1) ++stalls[axis];
++            else stalls[axis] = 0;
++            previous[axis] = position[axis];
++            if (stalls[axis] >= 10) {
++                stage = "stall";
++                ESP_LOGE(TAG, "Servo stalled id=%u command=%d position=%d samples=%d",
++                         fault_id, commanded[axis], position[axis], stalls[axis]);
++                goto fault;
++            }
++        }
++        if (next_ticket != ticket) {
++            ticket = next_ticket; quiet = 0;
++            target = pose == STACKCHAN_MOTION_REST ? zero[1] + 16 :
++                     pose == STACKCHAN_MOTION_ATTENTIVE ? zero[1] + 48 : commanded[1];
++            deadline = esp_timer_get_time() + POSE_TIMEOUT_US;
++        }
++        // New/canceled requests invalidate work after any blocking I/O.
++        if (atomic_load(&desired) != ticket) continue;
++        int step = motion_step(commanded[1], target);
++        if (step != commanded[1]) {
++            // Feedback may finish after task preemption. Never send another
++            // target once the existing pose deadline has already expired.
++            if (esp_timer_get_time() >= deadline) {
++                fault_id = 2; stage = "pose_timeout";
++                ESP_LOGE(TAG, "Servo pose timeout id=2 target=%d command=%d position=%d moving=%d",
++                         target, commanded[1], position[1], moving[1]);
++                goto fault;
++            }
++            fault_id = 2; stage = "slew_position";
++            if (!servo_position(2, step)) goto fault;
++            commanded[1] = step;
++        }
++        if (atomic_load(&desired) != ticket) continue;
++        if (commanded[1] == target && motion_abs(position[1] - target) <= 3 && !moving[1]) {
++            if (quiet < 2) ++quiet;
++            if (quiet >= 2 && atomic_load(&completed) != ticket) {
++                atomic_store(&completed, ticket);
++                ESP_LOGI(TAG, "Motion settled pose=%u servo=2 target=%d position=%d",
++                         (unsigned)pose, target, position[1]);
++            }
++        } else quiet = 0;
++        if (atomic_load(&completed) != ticket && esp_timer_get_time() >= deadline) {
++            fault_id = 2; stage = "pose_timeout";
++            ESP_LOGE(TAG, "Servo pose timeout id=2 target=%d command=%d position=%d moving=%d",
++                     target, commanded[1], position[1], moving[1]);
++            goto fault;
++        }
++    }
++fault:
++    ESP_LOGE(TAG, "Motion disabled: stage=%s servo=%u", stage, fault_id);
++done:
++    if ((atomic_load(&desired) & 3u) == STACKCHAN_MOTION_OFF)
++        ESP_LOGI(TAG, "Motion disabled: requested OFF");
++    release_motion();
++    // Static PSRAM task stack/TCB remain allocated; never forcibly delete a task
++    // while it owns UART/I2C. Disabled motion cannot be rearmed by a call.
++    vTaskSuspend(NULL);
++}
++
++esp_err_t stackchan_motion_init(void)
++{
++    if (attempted) return ESP_ERR_INVALID_STATE;
++    attempted = true;
++    esp_err_t err = nvs_flash_init(); // Never erase/reformat on an init error.
++    if (err != ESP_OK) return err;
++    nvs_handle_t calibration;
++    if (nvs_open("servo", NVS_READONLY, &calibration) != ESP_OK) return ESP_ERR_INVALID_STATE;
++    int32_t yaw = -1, pitch = -1;
++    bool valid = nvs_get_i32(calibration, "zero_pos_1", &yaw) == ESP_OK &&
++                 nvs_get_i32(calibration, "zero_pos_2", &pitch) == ESP_OK;
++    nvs_close(calibration);
++    if (!valid || !motion_calibration_valid(yaw, pitch)) return ESP_ERR_INVALID_STATE;
++    zero[0] = yaw; zero[1] = pitch;
++    i2c_master_bus_handle_t bus = NULL;
++    if (esp_board_manager_get_periph_handle("i2c_master", (void **)&bus) != ESP_OK || !bus) return ESP_ERR_INVALID_STATE;
++    const i2c_device_config_t cfg = {.dev_addr_length = I2C_ADDR_BIT_LEN_7,
++                                    .device_address = 0x6f, .scl_speed_hz = 100000};
++    err = i2c_master_bus_add_device(bus, &cfg, &py32);
++    if (err != ESP_OK) return err;
++    uint8_t version = 0;
++    bool found = false;
++    for (int i = 0; i < 6 && !found; ++i) {
++        found = read_reg(py32, 0x02, &version, 1) && version != 0 && version != 0xff;
++        if (!found) vTaskDelay(pdMS_TO_TICKS(200));
++    }
++    if (!found) goto fail;
++    // VM_EN is held off while configuring its pin and the shared external rail.
++    if (!py_bit(0x05, false) || !py_bit(0x13, false) || !py_bit(0x03, true) ||
++        !py_bit(0x0b, false) || !py_bit(0x09, true) || !configure_external_power(bus)) goto fail;
++    const uart_config_t uart_cfg = {.baud_rate = 1000000, .data_bits = UART_DATA_8_BITS,
++        .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
++        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT};
++    // Reserve UART1 without disturbing an existing owner.
++    if (uart_driver_install(MOTION_UART, 256, 256, 0, NULL, 0) != ESP_OK) goto fail;
++    uart_installed = true;
++    if (uart_param_config(MOTION_UART, &uart_cfg) != ESP_OK ||
++        uart_set_pin(MOTION_UART, 6, 7, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK ||
++        uart_set_rx_full_threshold(MOTION_UART, 1) != ESP_OK ||
++        uart_set_rx_timeout(MOTION_UART, 2) != ESP_OK) goto fail;
++    uart_ready = true;
++    StackType_t *stack = heap_caps_malloc(STACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (!stack) goto fail;
++    if ((atomic_load(&desired) & 3u) == STACKCHAN_MOTION_OFF || !py_bit(0x05, true)) {
++        heap_caps_free(stack); goto fail;
++    }
++    atomic_store(&available, true);
++    if (!xTaskCreateStaticPinnedToCore(motion_worker, "HEAD_MOTION", STACK_BYTES, NULL, 1, stack, &worker_tcb, 0)) {
++        heap_caps_free(stack); goto fail;
++    }
++    ESP_LOGI(TAG, "Optional head motion initialized; calibrated limits, no EEPROM writes");
++    return ESP_OK;
++fail:
++    release_motion();
++    if (uart_installed) { uart_driver_delete(MOTION_UART); uart_ready = uart_installed = false; }
++    if (py32) { i2c_master_bus_rm_device(py32); py32 = NULL; }
++    return ESP_FAIL;
++}
++#endif
+diff --git a/solutions/agora_demo/main/stackchan_motion.h b/solutions/agora_demo/main/stackchan_motion.h
+new file mode 100644
+index 0000000..daf2f40
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_motion.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <stdbool.h>
++#include "esp_err.h"
++
++typedef enum {
++    STACKCHAN_MOTION_REST, STACKCHAN_MOTION_ATTENTIVE,
++    STACKCHAN_MOTION_HOLD, STACKCHAN_MOTION_OFF
++} stackchan_motion_pose_t;
++
++// Call once during serialized board startup, after display and before touch.
++// No NVS/servo EEPROM writes. OFF and faults disable motion until reboot.
++esp_err_t stackchan_motion_init(void);
++// Atomics only: safe from the interaction phase's short critical section.
++void stackchan_motion_request(stackchan_motion_pose_t pose);
++// Disabled/faulted motion is settled so it never blocks a voice call.
++bool stackchan_motion_settled(void);
+diff --git a/solutions/agora_demo/main/stackchan_motion_math.h b/solutions/agora_demo/main/stackchan_motion_math.h
+new file mode 100644
+index 0000000..9e1c2f1
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_motion_math.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: MIT
++ * Protocol/power adaptation notices: see LICENSE.motion. */
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++static inline int motion_abs(int n) { return n < 0 ? -n : n; }
++static inline int motion_word(const uint8_t *p) { return ((int)p[0] << 8) | p[1]; }
++static inline int motion_load(const uint8_t *p)
++{
++    int n = motion_word(p);
++    return n & 1024 ? -(n & ~1024) : n;
++}
++static inline int motion_step(int current, int target)
++{
++    int delta = target - current;
++    return current + (delta > 2 ? 2 : delta < -2 ? -2 : delta);
++}
++static inline bool motion_calibration_valid(int yaw, int pitch)
++{
++    return yaw >= 100 && yaw <= 850 && pitch >= 100 && pitch <= 850;
++}
++static inline bool motion_start_valid(int axis, int position, int zero, int lo, int hi)
++{
++    // SCSCL stores a 10-bit EEPROM envelope (0..1023). Our commands/current
++    // positions keep the narrower 0..1000 software guard; factory max=1003 is
++    // confirmed on this robot and must not be rewritten or rejected outright.
++    if (lo < 0 || hi <= lo || hi > 1023 || position < lo || position > hi) return false;
++    if (axis == 0) return position >= 0 && position <= 1000;
++    return position >= zero && position <= zero + 272 && position <= 1000 &&
++           zero + 16 >= lo && zero + 48 <= hi;
++}
++// SCSCL: high byte first, checksum covers ID through final payload byte.
++static inline size_t motion_packet(uint8_t *out, uint8_t id, uint8_t instruction,
++                                   uint8_t reg, const uint8_t *data, size_t count)
++{
++    if (id < 1 || id > 2 || !data || count == 0 || count > 6) return 0;
++    out[0] = out[1] = 0xff; out[2] = id; out[3] = (uint8_t)(count + 3);
++    out[4] = instruction; out[5] = reg;
++    unsigned sum = id + out[3] + instruction + reg;
++    for (size_t i = 0; i < count; ++i) { out[6+i] = data[i]; sum += data[i]; }
++    out[6+count] = (uint8_t)~sum;
++    return count + 7;
++}
++static inline bool motion_response(const uint8_t *p, size_t size, uint8_t id, size_t count)
++{
++    if (count > 15 || size != count + 6 || p[0] != 0xff || p[1] != 0xff ||
++        p[2] != id || p[3] != count + 2 || p[4] != 0) return false;
++    unsigned sum = 0;
++    for (size_t i = 2; i < size; ++i) sum += p[i];
++    return (sum & 255) == 255;
++}
++// Matches the original M5Unified CoreS3 external-power safety guard.
++static inline bool motion_supply_safe(uint8_t axp_status, uint32_t outputs, int ts_raw)
++{
++    if ((axp_status & 0x08) || !(axp_status & 0x20) || (outputs & (1u << 1))) return true;
++    return ts_raw >= 0 && ts_raw < 0x3fff - 32 && ts_raw <= 4000;
++}
+diff --git a/solutions/agora_demo/main/stackchan_tls_diagnostics.c b/solutions/agora_demo/main/stackchan_tls_diagnostics.c
+new file mode 100644
+index 0000000..e5eebcb
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_tls_diagnostics.c
+@@ -0,0 +1,183 @@
++// Opt-in metadata observer for the vendored ESP-IDF mbedTLS debug API.
++// Never invoke the raw callback or log strings, pointers, records, certificates,
++// session identifiers or keys supplied by mbedTLS.
++#include "sdkconfig.h"
++#include "stackchan_tls_diagnostics.h"
++#include <limits.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdatomic.h>
++#include <string.h>
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "mbedtls/debug.h"
++#include "mbedtls/ssl.h"
++
++#if !defined(CONFIG_STACKCHAN_TLS_HANDSHAKE_DIAGNOSTICS) || !defined(CONFIG_MBEDTLS_DEBUG) || CONFIG_MBEDTLS_DEBUG_LEVEL != 2
++#error "Handshake diagnostics require opt-in and mbedTLS debug level exactly 2"
++#endif
++
++static const char *TAG = "STACKCHAN_TLS";
++static struct {
++    unsigned request, phases, phase, tx_bytes, rx_bytes, tx_calls, rx_calls;
++    unsigned in_left, want;
++    int last_send, last_recv;
++    int64_t started, first_rx_ms;
++} trace;
++static _Atomic(TaskHandle_t) trace_owner;
++
++static void add_saturated(unsigned *value, unsigned add)
++{
++    *value = UINT_MAX - *value < add ? UINT_MAX : *value + add;
++}
++
++// debug.c bounds its line to 512 bytes, then may prepend "%p: ".
++static const char *message_body(const char *str)
++{
++    if (!str) return NULL;
++    size_t n = 0;
++    while (n < 532 && str[n]) ++n;
++    if (!n || n == 532 || str[n - 1] != '\n') return NULL;
++    if (n > 2 && str[0] == '0' && str[1] == 'x') {
++        size_t i = 2;
++        while (i < n && ((str[i] >= '0' && str[i] <= '9') ||
++               (str[i] >= 'a' && str[i] <= 'f') || (str[i] >= 'A' && str[i] <= 'F'))) ++i;
++        if (i == 2 || i > 18 || i + 2 >= n || str[i] != ':' || str[i + 1] != ' ') return NULL;
++        return str + i + 2;
++    }
++    return str;
++}
++
++static bool decimal(const char **p, unsigned *value)
++{
++    const char *s = *p;
++    if (*s < '0' || *s > '9') return false;
++    unsigned n = 0;
++    do {
++        unsigned d = (unsigned)(*s - '0');
++        if (n > (UINT_MAX - d) / 10) return false;
++        n = n * 10 + d;
++        ++s;
++    } while (*s >= '0' && *s <= '9');
++    *p = s; *value = n;
++    return true;
++}
++
++static bool returned(const char *body, const char *prefix, int *result)
++{
++    size_t n = strlen(prefix);
++    if (strncmp(body, prefix, n)) return false;
++    const char *p = body + n;
++    bool negative = *p == '-';
++    if (negative) ++p;
++    unsigned magnitude;
++    if (!decimal(&p, &magnitude) || magnitude > (negative ? (unsigned)INT_MAX + 1U : (unsigned)INT_MAX)) return false;
++    if (strncmp(p, " (-0x", 5)) return false;
++    p += 5;
++    unsigned hex = 0, digits = 0;
++    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')) {
++        if (++digits > 8) return false;
++        hex = hex * 16U + (unsigned)(*p <= '9' ? *p - '0' : *p - 'a' + 10);
++        ++p;
++    }
++    if (!digits || strcmp(p, ")\n")) return false;
++    int ret = negative ? (magnitude == (unsigned)INT_MAX + 1U ? INT_MIN : -(int)magnitude) : (int)magnitude;
++    if (hex != 0U - (unsigned)ret) return false;
++    *result = ret;
++    return true;
++}
++
++static void filtered_debug(void *ctx, int level, const char *file, int line, const char *str)
++{
++    (void)ctx; (void)file; (void)line;
++    TaskHandle_t owner = atomic_load(&trace_owner);
++    if (level != 2 || !owner || xTaskGetCurrentTaskHandle() != owner) return;
++    const char *body = message_body(str);
++    if (!body || (trace.phases & (1U << 15))) return;
++    // Local IDs are independent of private mbedTLS enums. SERVER_HELLO follows
++    // ClientHello flush to the BIO, which is not proof of remote delivery.
++    static const char *const states[] = {
++        "client state: MBEDTLS_SSL_CLIENT_HELLO\n",
++        "client state: MBEDTLS_SSL_SERVER_HELLO\n",
++        "client state: MBEDTLS_SSL_SERVER_CERTIFICATE\n",
++        "client state: MBEDTLS_SSL_SERVER_KEY_EXCHANGE\n",
++        "client state: MBEDTLS_SSL_CERTIFICATE_REQUEST\n",
++        "client state: MBEDTLS_SSL_SERVER_HELLO_DONE\n",
++        "client state: MBEDTLS_SSL_CLIENT_CERTIFICATE\n",
++        "client state: MBEDTLS_SSL_CLIENT_KEY_EXCHANGE\n",
++        "client state: MBEDTLS_SSL_CERTIFICATE_VERIFY\n",
++        "client state: MBEDTLS_SSL_CLIENT_CHANGE_CIPHER_SPEC\n",
++        "client state: MBEDTLS_SSL_CLIENT_FINISHED\n",
++        "client state: MBEDTLS_SSL_SERVER_CHANGE_CIPHER_SPEC\n",
++        "client state: MBEDTLS_SSL_SERVER_FINISHED\n",
++        "client state: MBEDTLS_SSL_FLUSH_BUFFERS\n",
++        "client state: MBEDTLS_SSL_HANDSHAKE_WRAPUP\n",
++        "handshake: done\n",
++    };
++    for (unsigned i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
++        if (strcmp(body, states[i])) continue;
++        trace.phase = i + 1;
++        unsigned bit = 1U << i;
++        if (!(trace.phases & bit)) {
++            trace.phases |= bit;
++            ESP_LOGI(TAG, "TLS phase req=%u phase=%u ms=%lld tx=%u rx=%u",
++                     trace.request, trace.phase, (long long)((esp_timer_get_time() - trace.started) / 1000),
++                     trace.tx_bytes, trace.rx_bytes);
++        }
++        return;
++    }
++    // No application I/O or warm HTTP metadata after handshake completion.
++    if (!trace.phase || (trace.phases & (1U << 15))) return;
++    int ret;
++    if (returned(body, "ssl->f_send() returned ", &ret)) {
++        trace.last_send = ret;
++        add_saturated(&trace.tx_calls, 1);
++        if (ret > 0) add_saturated(&trace.tx_bytes, (unsigned)ret);
++    } else if (returned(body, "ssl->f_recv(_timeout)() returned ", &ret)) {
++        trace.last_recv = ret;
++        add_saturated(&trace.rx_calls, 1);
++        if (ret > 0) {
++            if (trace.first_rx_ms < 0) trace.first_rx_ms = (esp_timer_get_time() - trace.started) / 1000;
++            add_saturated(&trace.rx_bytes, (unsigned)ret);
++        }
++    } else if (!strncmp(body, "in_left: ", 9)) {
++        const char *p = body + 9;
++        unsigned left, want;
++        if (!decimal(&p, &left) || strncmp(p, ", nb_want: ", 11)) return;
++        p += 11;
++        if (!decimal(&p, &want) || strcmp(p, "\n")) return;
++        trace.in_left = left; trace.want = want;
++    }
++}
++
++void __wrap_mbedtls_esp_enable_debug_log(mbedtls_ssl_config *conf, int threshold)
++{
++    (void)threshold;
++    // Never invoke Espressif's raw callback. Fixed level excludes secret dumps
++    // even if another caller requests a larger threshold.
++    mbedtls_debug_set_threshold(2);
++    mbedtls_ssl_conf_dbg(conf, filtered_debug, NULL);
++}
++
++void stackchan_tls_diagnostics_begin(unsigned request)
++{
++    memset(&trace, 0, sizeof(trace));
++    trace.request = request;
++    trace.started = esp_timer_get_time();
++    trace.first_rx_ms = -1;
++    atomic_store(&trace_owner, xTaskGetCurrentTaskHandle());
++}
++
++void stackchan_tls_diagnostics_end(void)
++{
++    atomic_store(&trace_owner, NULL);
++    if (!trace.phases) return; // A reused connection may not handshake.
++    // mbedTLS suppresses WANT_READ return logs: these are observed returns,
++    // not a count of every BIO call. Positive byte returns are not suppressed.
++    ESP_LOGI(TAG, "TLS summary req=%u phase=%u mask=%u tx=%u rx=%u send_returns=%u recv_returns=%u sendret=%d recvret=%d first_rx_ms=%lld in_left=%u want=%u",
++             trace.request, trace.phase, trace.phases, trace.tx_bytes, trace.rx_bytes,
++             trace.tx_calls, trace.rx_calls, trace.last_send, trace.last_recv,
++             (long long)trace.first_rx_ms, trace.in_left, trace.want);
++}
+diff --git a/solutions/agora_demo/main/stackchan_tls_diagnostics.h b/solutions/agora_demo/main/stackchan_tls_diagnostics.h
+new file mode 100644
+index 0000000..2c595d6
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_tls_diagnostics.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++// Single control-worker scope; no connection or TLS policy changes.
++void stackchan_tls_diagnostics_begin(unsigned request);
++void stackchan_tls_diagnostics_end(void);

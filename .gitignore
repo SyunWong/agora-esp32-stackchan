@@ -1,0 +1,9 @@
+private/
+build/
+esp-webrtc-solution/
+service/web/agora.js
+__pycache__/
+*.pyc
+.env
+.env.*
+*.bin

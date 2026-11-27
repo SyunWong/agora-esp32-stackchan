@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Call StackChan</title>
+<style>
+  :root {
+    --sans: "Inter", "Helvetica Neue", -apple-system, system-ui, sans-serif;
+    --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+    --red: #ff5a4e;
+  }
+  /* A · Graphite — dark, warm orange taken from StackChan's camera ring */
+  body.t-graphite { --bg:#0d0e10; --ink:#f2f0ec; --ink-2:#b9b6b0; --muted:#7c7a76; --line:rgba(255,255,255,.10);
+    --field:#16181b; --field-off:#121315; --panel-a:#24272c; --panel-b:#111214; --panel-ink:#f2f0ec; --panel-dim:rgba(242,240,236,.55);
+    --ring:rgba(255,255,255,.05); --accent:#ff8a3d; --accent-ink:#1a0d03; --btn:#f2f0ec; --btn-ink:#0d0e10; --shadow:rgba(0,0,0,.6); --bp-op:.13; --bp-filter:none; }
+  /* B · Paper — warm white, near-black ink, orange accent */
+  body.t-paper { --bg:#f7f5f0; --ink:#17171a; --ink-2:#47464a; --muted:#8d8a84; --line:rgba(23,23,26,.12);
+    --field:#ffffff; --field-off:#f2f0ea; --panel-a:#ebe7df; --panel-b:#dcd6cb; --panel-ink:#17171a; --panel-dim:rgba(23,23,26,.55);
+    --ring:rgba(23,23,26,.06); --accent:#ff7a2f; --accent-ink:#fff; --btn:#17171a; --btn-ink:#fff; --shadow:rgba(80,60,30,.35); --bp-op:.22; --bp-filter:invert(1); }
+  /* C · Moss — soft sage page, deep green panel, butter accent */
+  body.t-moss { --bg:#e8ebe4; --ink:#16201b; --ink-2:#3f4a44; --muted:#7f8982; --line:rgba(22,32,27,.13);
+    --field:#f5f7f2; --field-off:#e1e5dd; --panel-a:#2e4a3d; --panel-b:#16271f; --panel-ink:#eef2ec; --panel-dim:rgba(238,242,236,.6);
+    --ring:rgba(255,255,255,.06); --accent:#f3cf5a; --accent-ink:#16201b; --btn:#16201b; --btn-ink:#eef2ec; --shadow:rgba(10,30,20,.5); --bp-op:.14; --bp-filter:none; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  .mono { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+
+  .nav { max-width: 1280px; margin: 0 auto; padding: 26px 48px; display: flex; justify-content: space-between; align-items: center; }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -.02em; font-size: 17px; }
+  .logo i { width: 22px; height: 18px; border-radius: 5px; background: var(--ink); position: relative; }
+  .logo i::before, .logo i::after { content: ""; position: absolute; top: 6px; width: 3px; height: 3px; border-radius: 50%; background: var(--accent); }
+  .logo i::before { left: 6px; } .logo i::after { right: 6px; }
+
+  .page {
+    max-width: 1280px; margin: 0 auto; padding: 24px 48px 56px;
+    display: grid; grid-template-columns: minmax(360px, 1fr) minmax(460px, 600px); gap: 72px; align-items: center;
+  }
+
+  /* ---------- left ---------- */
+  .tag { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px 6px 10px; border-radius: 999px; background: var(--field); border: 1px solid var(--line); font-size: 13px; color: var(--ink-2); }
+  .tag b { width: 7px; height: 7px; border-radius: 50%; background: #2fbf71; box-shadow: 0 0 0 3px rgba(47,191,113,.18); }
+  h1 { margin: 22px 0 20px; font-size: clamp(56px, 6.4vw, 92px); line-height: .92; letter-spacing: -.055em; font-weight: 800; }
+  h1 span { color: var(--accent); }
+  .lede { font-size: 17px; line-height: 1.6; color: var(--ink-2); max-width: 40ch; margin: 0 0 36px; }
+
+  form { max-width: 440px; display: flex; flex-direction: column; gap: 16px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  label { font-size: 13px; font-weight: 600; color: var(--ink-2); }
+  input, select {
+    font: inherit; font-size: 15px; color: var(--ink); width: 100%; height: 46px; padding: 0 14px;
+    background: var(--field); border: 1px solid var(--line); border-radius: 12px; outline: none; transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent); }
+  input:disabled, select:disabled { color: var(--muted); background: var(--field-off); }
+  select { appearance: none; padding-right: 36px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1.5l5 5 5-5' stroke='%23111316' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 14px center; }
+
+  .level { display: flex; gap: 3px; height: 16px; align-items: center; padding: 0 2px; }
+  .level span { flex: 1; height: 4px; border-radius: 2px; background: var(--line); transition: height .08s, background .08s; }
+  .level span.on { background: var(--accent); }
+
+  .actions { display: flex; gap: 10px; margin-top: 6px; }
+  button { font: inherit; border: 0; cursor: pointer; transition: transform .1s, background .15s, opacity .15s, color .15s; }
+  button:active:not(:disabled) { transform: scale(.98); }
+  button:disabled { opacity: .3; cursor: default; }
+  .btn-call { flex: 1; height: 56px; border-radius: 16px; background: var(--btn); color: var(--btn-ink); font-size: 16px; font-weight: 650;
+    display: flex; align-items: center; justify-content: center; gap: 10px; }
+  .btn-call svg { width: 19px; height: 19px; color: var(--accent); transition: transform .3s; }
+  .btn-call:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn-call.hang, .btn-call.hang:hover { background: var(--red); }
+  .btn-call.hang svg { color: #fff; transform: rotate(135deg); }
+  .btn-mute { width: 56px; height: 56px; border-radius: 16px; background: var(--field); border: 1px solid var(--line); color: var(--ink); display: grid; place-items: center; }
+  .btn-mute[aria-pressed="true"] { color: var(--red); border-color: var(--red); }
+  .btn-mute svg { width: 20px; height: 20px; }
+  .fine { font-size: 13px; color: var(--muted); line-height: 1.5; margin-top: 4px; }
+
+  /* ---------- right: incoming-call screen ---------- */
+  .phone {
+    position: relative; aspect-ratio: 1 / 1.1; border-radius: 36px; overflow: hidden; color: var(--panel-ink);
+    background: radial-gradient(110% 85% at 50% 36%, var(--panel-a) 0%, var(--panel-b) 100%);
+    box-shadow: 0 40px 80px -40px var(--shadow);
+  }
+  .blueprint { position: absolute; z-index: 0; left: -8%; top: 4%; width: 116%; opacity: var(--bp-op); filter: var(--bp-filter); pointer-events: none; }
+  .phone svg.rings { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .phone-top { position: absolute; top: 24px; left: 28px; right: 28px; display: flex; justify-content: space-between; align-items: center; z-index: 3; }
+  .phone-top .mono { color: var(--panel-dim); }
+  #timer { font-family: var(--mono); font-size: 13px; color: var(--panel-ink); font-variant-numeric: tabular-nums; }
+
+  .mode { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-radius: 15px;
+    background: var(--ring); font-size: 12.5px; font-weight: 600; color: var(--panel-ink); border: 1px solid var(--ring); transition: background .2s, color .2s; }
+  .mode b { width: 6px; height: 6px; border-radius: 50%; background: var(--panel-ink); opacity: .7; }
+  [data-s="calling"] .mode b { background: var(--accent); opacity: 1; animation: blink .7s infinite; }
+  [data-s="connected"] .mode { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  [data-s="connected"] .mode b { background: var(--accent-ink); }
+  @keyframes blink { 50% { opacity: .2; } }
+
+  .bot { position: absolute; left: 50%; top: 47%; width: 58%; transform: translate(-50%, -50%); z-index: 2;
+    filter: drop-shadow(0 30px 26px var(--shadow)) drop-shadow(0 4px 5px var(--shadow)); }
+  .bot-inner { position: relative; }
+  .bot img { width: 100%; display: block; }
+  .face { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+
+  .bubble { position: absolute; z-index: 4; left: 64%; top: 15%;
+    background: var(--accent); color: var(--accent-ink); font-weight: 650; font-size: 17px; padding: 10px 16px; border-radius: 16px 16px 16px 4px;
+    opacity: 0; transform: translateY(8px); transition: opacity .25s, transform .25s; white-space: nowrap; }
+  .bubble.show { opacity: 1; transform: none; }
+
+  .callerid { position: absolute; left: 28px; right: 28px; bottom: 26px; z-index: 3; display: flex; align-items: flex-end; justify-content: space-between; }
+  .callerid .who { font-size: 30px; font-weight: 750; letter-spacing: -.03em; }
+  .callerid .what { font-size: 14px; color: var(--panel-dim); margin-top: 4px; }
+  .wave { display: flex; gap: 3px; align-items: center; height: 34px; }
+  .wave i { width: 4px; height: 4px; border-radius: 2px; background: var(--panel-dim); transition: height .1s; }
+  [data-s="connected"] .wave i { background: var(--accent); }
+
+  @media (max-width: 980px) {
+    .page { grid-template-columns: 1fr; padding: 8px 20px 40px; gap: 32px; }
+    .nav { padding: 20px; }
+    .right { order: -1; }
+  }
+</style>
+</head>
+<body class="t-graphite" data-s="idle">
+  <nav class="nav">
+    <div class="logo"><i></i>StackChan</div>
+    <span class="mono">StackChan Calls</span>
+  </nav>
+
+  <main class="page">
+    <!-- ============ LEFT ============ -->
+    <section>
+      <span class="tag"><b></b>StackChan is on my desk right now</span>
+      <h1>Ring<br/>my desk<span>.</span></h1>
+      <p class="lede">StackChan usually chats with its own AI. Call this line and it switches over — your voice plays from its speaker, and I answer through its mics.</p>
+
+      <form id="callForm" autocomplete="off">
+        <div class="row">
+          <div class="field">
+            <label for="name">Your name</label>
+            <input id="name" value="Alex" maxlength="32" autocomplete="given-name" />
+          </div>
+          <div class="field">
+            <label for="password">Call password</label>
+            <input id="password" type="password" maxlength="128" autocomplete="off" placeholder="Required" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="mic">Microphone</label>
+          <select id="mic"><option value="">System default</option></select>
+          <div class="level" id="level"></div>
+        </div>
+        <div class="actions">
+          <button type="submit" class="btn-call" id="callBtn">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1A17 17 0 0 1 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>
+            <span id="callLabel">Call StackChan</span>
+          </button>
+          <button type="button" class="btn-mute" id="muteBtn" aria-pressed="false" aria-label="Mute" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5.5 10.5v.5a6.5 6.5 0 0 0 13 0v-.5M12 17.5v4"/><line id="muteSlash" x1="4" y1="4" x2="20" y2="20" style="display:none"/></svg>
+          </button>
+        </div>
+        <button type="button" id="resume-playback" hidden>Resume speaker audio</button>
+        <p class="fine">Your mic turns on only after you press call. Wear headphones so StackChan doesn't hear itself.</p>
+      </form>
+    </section>
+
+    <!-- ============ RIGHT ============ -->
+    <section class="right">
+      <div class="phone" id="phone">
+        <img class="blueprint" src="lines.png" alt="" aria-hidden="true" />
+        <svg class="rings" viewBox="0 0 600 660" preserveAspectRatio="xMidYMid slice">
+          <g id="rings" fill="none" stroke="var(--accent)" stroke-width="2"></g>
+        </svg>
+
+        <div class="phone-top">
+          <span class="mode"><b></b><span id="modeText">AI mode</span></span>
+          <span id="timer"></span>
+        </div>
+
+        <div class="bubble" id="bubble">hi~</div>
+
+        <div class="bot">
+          <div class="bot-inner" id="botInner">
+            <img src="stackchan.png" alt="StackChan" />
+            <svg class="face" viewBox="0 0 717 808">
+              <g transform="rotate(-2.5 434 262)">
+                <g id="blush" opacity="0" fill="#ff8095">
+                  <rect x="296" y="272" width="13" height="13"/><rect x="312" y="283" width="13" height="13"/>
+                  <rect x="556" y="262" width="13" height="13"/><rect x="572" y="273" width="13" height="13"/>
+                </g>
+                <ellipse id="eyeL" cx="352" cy="242" rx="9.5" ry="9.5" fill="#fff"/>
+                <ellipse id="eyeR" cx="517" cy="242" rx="9.5" ry="9.5" fill="#fff"/>
+                <rect id="mouth" x="390" y="283" width="108" height="11" rx="1.5" fill="#fff"/>
+              </g>
+            </svg>
+          </div>
+        </div>
+
+        <div class="callerid">
+          <div>
+            <div class="who">StackChan</div>
+            <div class="what" id="statusText" role="status" aria-live="polite">Enter the password to check availability and call</div>
+          </div>
+          <div class="wave" id="wave"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+<script>
+if(location.hash)history.replaceState(null,'',location.pathname+location.search);
+</script>
+<script src="/agora.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+
+const NB = 32; for (let i = 0; i < NB; i++) $('level').appendChild(document.createElement('span'));
+const bars = [...$('level').children];
+const NW = 14; for (let i = 0; i < NW; i++) $('wave').appendChild(document.createElement('i'));
+const wave = [...$('wave').children];
+
+/* ---------- face + motion ---------- */
+const A = { state: 'idle', muted: false, mouth: 0, mouthT: 0, look: 0, lookT: 0 };
+let nextBlink = performance.now() + 2000, blinkUntil = 0, nextLook = 0;
+function frame(t) {
+  A.mouth += (A.mouthT - A.mouth) * .35;
+  if (t > nextBlink) { blinkUntil = t + 120; nextBlink = t + 2200 + Math.random() * 3200; }
+  if (A.state === 'calling' && t > nextLook) { A.lookT = A.lookT > 0 ? -8 : 8; nextLook = t + 520; }
+  if (A.state !== 'calling') A.lookT = 0;
+  A.look += (A.lookT - A.look) * .25;
+
+  const ry = t < blinkUntil ? 1.2 : 9.5;
+  $('eyeL').setAttribute('cx', 352 + A.look * 2); $('eyeR').setAttribute('cx', 517 + A.look * 2);
+  $('eyeL').setAttribute('ry', ry); $('eyeR').setAttribute('ry', ry);
+
+  const o = A.mouth;
+  const h = 11 + o * 40, w = 108 - o * 30, m = $('mouth');
+  m.setAttribute('height', h); m.setAttribute('y', 289 - h / 2);
+  m.setAttribute('width', w); m.setAttribute('x', 444 - w / 2);
+
+  let dx = 0, dy = Math.sin(t / 1500) * 2.5;
+  if (A.state === 'calling') dx = Math.sin(t / 110) * 2.5;             // buzzing like a phone
+  if (A.state === 'connected') dy += Math.sin(t / 700) * 1.5 - o * 3;  // small nods while talking
+  $('botInner').style.transform = `translate(${dx}px, ${dy}px)`;
+
+  // voice wave under caller id
+  wave.forEach((el, i) => {
+    const v = A.state === 'connected' ? o * (0.4 + 0.6 * Math.abs(Math.sin(t / 120 + i * 0.9))) : 0;
+    el.style.height = (4 + v * 28) + 'px';
+  });
+
+  let rs = '';
+  if (A.state === 'calling') for (let i = 0; i < 3; i++) {
+    const p = ((t / 1600) + i / 3) % 1;
+    rs += `<circle cx="300" cy="300" r="${150 + p * 200}" opacity="${(1 - p) * .8}"/>`;
+  }
+  $('rings').innerHTML = rs;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+let bt; function say(text, ms) {
+  clearTimeout(bt); const b = $('bubble');
+  if (!text) return b.classList.remove('show');
+  b.textContent = text; b.classList.add('show');
+  if (ms) bt = setTimeout(() => b.classList.remove('show'), ms);
+}
+
+/* =====================================================================
+   UI API — drive it from your call code:
+   UI.setState('idle'|'calling'|'connected'|'ended'|'error', msg?)
+   UI.setLocalLevel(0..1)   caller's mic → level bars
+   UI.setRemoteLevel(0..1)  voice coming back from StackChan → mouth + wave
+   UI.setMuted(bool)
+   ===================================================================== */
+const UI = {
+  state: 'idle', muted: false, t0: 0, tick: null,
+  setState(state, msg) {
+    if(this.state === state && state === 'connected')return;
+    this.state = state; A.state = state;
+    document.body.dataset.s = state;
+    const live = state === 'calling' || state === 'connected';
+    const who = $('name').value.trim() || 'you';
+    $('modeText').textContent = { idle: 'Standby', calling: 'Switching to call', connected: 'Call mode', ended: 'Call ended', error: 'Standby' }[state];
+    $('statusText').textContent = {
+      idle: 'Enter the password to check availability and call',
+      calling: 'Ringing on my desk…',
+      connected: `On a call with ${who}`,
+      ended: 'Call ended',
+      error: msg || 'Couldn’t connect',
+    }[state];
+    $('callBtn').classList.toggle('hang', live);
+    $('callLabel').textContent = live ? 'Hang up' : 'Call StackChan';
+    $('muteBtn').disabled = state !== 'connected';
+    ['name', 'password', 'mic'].forEach(id => $(id).disabled = live);
+    $('blush').setAttribute('opacity', state === 'connected' ? 1 : 0);
+
+    if (state === 'calling') say('incoming!');
+    else if (state === 'connected') say(`hi ${who}!`, 2800);
+    else if (state === 'ended') say('bye~', 1800);
+    else say('');
+
+    clearInterval(this.tick); $('timer').textContent = '';
+    if (state === 'connected') {
+      this.t0 = Date.now();
+      this.tick = setInterval(() => {
+        const s = Math.floor((Date.now() - this.t0) / 1000);
+        $('timer').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+      }, 500);
+    }
+    if (!live) { this.setLocalLevel(0); this.setRemoteLevel(0); this.setMuted(false); }
+  },
+  setMuted(m) {
+    this.muted = m; A.muted = m;
+    $('muteBtn').setAttribute('aria-pressed', m);
+    $('muteSlash').style.display = m ? '' : 'none';
+    if (this.state === 'connected') m ? say('you’re muted') : say('');
+  },
+  setLocalLevel(v) {
+    const n = this.muted ? 0 : Math.round(Math.min(1, v) * NB);
+    bars.forEach((b, i) => { const on = i < n; b.classList.toggle('on', on); b.style.height = on ? (4 + 12 * Math.sin(Math.PI * (i + .5) / NB)) + 'px' : '4px'; });
+  },
+  setRemoteLevel(v) { A.mouthT = Math.min(1, v); },
+};
+window.StackChanUI = UI;
+
+/* ---------- mic list ---------- */
+async function listMics() {
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const sel = $('mic'), keep = sel.value;
+    sel.innerHTML = '<option value="">System default</option>';
+    devs.filter(d => d.kind === 'audioinput' && d.deviceId !== 'default').forEach(d => {
+      const o = document.createElement('option'); o.value = d.deviceId; o.textContent = d.label || 'Microphone'; sel.appendChild(o);
+    });
+    sel.value = keep;
+  } catch {}
+}
+navigator.mediaDevices?.addEventListener?.('devicechange', listMics);
+listMics();
+
+// Existing cloud call protocol; credentials and capabilities stay in tab memory.
+AgoraRTC.setLogLevel(3);
+const encoderConfig={sampleRate:16000,stereo:false,bitrate:32};
+const terminalStates=new Set(['ended']);
+const liveStates=new Set(['ringing','accepting','connecting','active']);
+let attempt=null,pageOpen=true,cleanup=null,callerSession='',accessExpires=0,accessTimer;
+function current(a){return pageOpen&&attempt===a&&!a.closed;}
+function accessValid(){return !!callerSession&&Date.now()<accessExpires*1000;}
+function syncAccess(){
+  if(!accessValid()){callerSession='';accessExpires=0;}
+  $('password').placeholder=accessValid()?'Unlocked in this tab':'Required';
+}
+function clearAccess(){callerSession='';accessExpires=0;clearTimeout(accessTimer);syncAccess();}
+function errorText(error){
+  return ({password_invalid:'Incorrect password. Please try again.',session_expired:'Session expired. Enter the password again.',
+    session_required:'Enter the call password.',rate_limited:'Too many attempts. Wait a minute before trying again.',
+    device_offline:'StackChan is offline. Please try again when it is online.',device_busy:'StackChan is busy. Please try again shortly.',
+    call_busy:'StackChan is already on a call.',session_busy:'StackChan is busy. Please try again shortly.',
+    invalid_name:'Use a short English name with letters, spaces, apostrophes or hyphens.',
+    password_required:'Enter the call password.',invalid_session:'Could not unlock calls. Please try again.',
+    invalid_configuration:'The call service configuration is unavailable.'})[error.code]||'Could not connect. Check your microphone permission and connection, then try again.';
+}
+function randomId(){return Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join('');}
+async function api(path,body,capability,keepalive=false){
+  const headers={'Content-Type':'application/json'};
+  if(capability)headers.Authorization='Bearer '+capability;
+  const response=await fetch(path,{method:'POST',headers,body:JSON.stringify(body),cache:'no-store',
+    keepalive,signal:AbortSignal.timeout(keepalive?2000:5000)});
+  const value=await response.json();
+  if(!response.ok){const error=Error('request_failed');error.code=typeof value.error==='string'?value.error:'';error.status=response.status;throw error;}
+  return value;
+}
+function releaseTrack(track){if(track){try{track.stop();}catch(_){}try{track.close();}catch(_){}}}
+function closeMicrophone(a){
+  const track=a.mic;a.mic=null;a.published=false;
+  releaseTrack(track);
+}
+function stopRemoteAudio(a){
+  for(const track of a.remoteTracks){try{track.stop();}catch(_){}}
+  if(a.client)for(const user of a.client.remoteUsers){try{user.audioTrack?.stop();}catch(_){}}
+  a.remoteTrack=null;
+}
+function endRemote(a,keepalive=false){
+  if(!a.callId||!a.capability)return Promise.resolve();
+  if(a.endPromise)return a.endPromise;
+  a.endPromise=api('/calls/end',{call_id:a.callId},a.capability,keepalive).catch(()=>{});
+  return a.endPromise;
+}
+function finish(a,title='Ended',detail='The call has ended.',keepalive=false){
+  if(a.closed){endRemote(a,keepalive);return a.cleanupPromise||Promise.resolve();}
+  a.closed=true;clearTimeout(a.pollTimer);clearTimeout(a.expiryTimer);
+  closeMicrophone(a);stopRemoteAudio(a);
+  if(attempt===a){
+    attempt=null;$('resume-playback').hidden=true;
+    UI.setState(title==='Ended'||title==='Rejected'?'ended':'error',detail);
+    $('statusText').textContent=detail;
+    syncAccess();
+  }
+  const remoteEnd=endRemote(a,keepalive);
+  a.cleanupPromise=(async()=>{
+    if(a.joinPromise)await a.joinPromise.catch(()=>{});
+    if(a.client){try{await a.client.leave();}catch(_){}stopRemoteAudio(a);}
+    await remoteEnd;
+  })();
+  cleanup=a.cleanupPromise;
+  a.cleanupPromise.finally(()=>{if(cleanup===a.cleanupPromise)cleanup=null;});
+  return a.cleanupPromise;
+}
+function callSnapshot(a,value){
+  const call=value?.call;
+  if(!call||call.id!==a.callId||(!liveStates.has(call.state)&&!terminalStates.has(call.state)))throw Error('invalid_call');
+  return call;
+}
+function endedDetail(reason){
+  if(reason==='rejected')return ['Rejected','StackChan declined your call.'];
+  if(reason==='ring_timeout'||reason==='ringing_timeout'||reason==='no_answer')return ['Ended','No answer from StackChan.'];
+  if(reason==='device_offline'||reason==='device_timeout')return ['Ended','StackChan went offline.'];
+  return ['Ended','The call has ended.'];
+}
+function renderCall(a){
+  if(!current(a))return;
+  const connected=a.published&&a.remoteTrack;
+  const state=connected?'connected':'calling';
+  if(UI.state!==state)UI.setState(state);
+  if(a.callState==='ringing')$('statusText').textContent='Ringing · say “Answer” or tap StackChan to accept';
+  else if(a.callState==='accepting')$('statusText').textContent='Accepted · preparing your private call…';
+  else if(!connected)$('statusText').textContent='Connecting private audio…';
+  else $('statusText').textContent=a.muted?'Your microphone is muted.':'On a call with '+$('name').value.trim();
+  if(a.playbackBlocked)$('statusText').textContent='Click Resume speaker audio to hear StackChan.';
+  $('muteBtn').disabled=!connected||a.muteBusy;
+}
+function grantIsValid(rtc){
+  return rtc&&typeof rtc.appId==='string'&&rtc.appId.length>0&&
+    typeof rtc.channel==='string'&&/^stackchan-human-[a-zA-Z0-9_-]+$/.test(rtc.channel)&&
+    rtc.uid==='20002'&&rtc.robotUid==='20001'&&typeof rtc.token==='string'&&rtc.token.length>0&&
+    Number.isInteger(rtc.ttl)&&rtc.ttl>0&&rtc.ttl<=600&&Number.isInteger(rtc.expiresAt)&&
+    rtc.expiresAt>Date.now()/1000&&rtc.expiresAt<=Date.now()/1000+605;
+}
+async function subscribeRobot(a,user,type){
+  if(!current(a)||type!=='audio'||String(user.uid)!=='20001'||a.subscribing)return;
+  if(a.remoteTrack&&a.remoteTrack===user.audioTrack)return;
+  a.subscribing=true;
+  try{
+    await a.client.subscribe(user,'audio');
+    if(!current(a)){user.audioTrack?.stop();return;}
+    if(!user.audioTrack)throw Error('missing_track');
+    a.remoteTrack=user.audioTrack;a.remoteTracks.add(user.audioTrack);
+    user.audioTrack.play();renderCall(a);
+  }catch(_){if(current(a))finish(a,'Error','Could not receive StackChan audio. Please try again.');}
+  finally{a.subscribing=false;}
+}
+async function connectPrivate(a,grant){
+  if(!current(a)||a.connecting||a.joined)return;
+  if(!grantIsValid(grant))throw Error('invalid_grant');
+  a.connecting=true;a.channel=grant.channel;
+  const client=a.client=AgoraRTC.createClient({mode:'rtc',codec:'vp8'});
+  client.on('user-published',(user,type)=>subscribeRobot(a,user,type));
+  client.on('user-left',user=>{if(current(a)&&String(user.uid)==='20001')finish(a,'Ended','StackChan ended the call.');});
+  client.on('user-unpublished',(user,type)=>{if(current(a)&&String(user.uid)==='20001'&&type==='audio'){stopRemoteAudio(a);renderCall(a);}});
+  client.on('token-privilege-did-expire',()=>{if(current(a))finish(a,'Ended','The private call expired.');});
+  client.on('connection-state-change',state=>{
+    if(current(a)&&a.joined&&(state==='RECONNECTING'||state==='DISCONNECTED'))finish(a,'Error','The voice connection was lost. Please call again.');
+  });
+  a.expiryTimer=setTimeout(()=>{if(current(a))finish(a,'Ended','The private call reached its time limit.');},grant.ttl*1000);
+  try{
+    a.joinPromise=client.join(grant.appId,grant.channel,grant.token,grant.uid);
+    await a.joinPromise;
+    if(!current(a)){await client.leave().catch(()=>{});return;}
+    a.joined=true;
+    // Confirm the call is still live after a potentially slow RTC join. A late
+    // grant or completed join must never authorize publishing by itself.
+    const confirmed=await api('/calls/poll',{call_id:a.callId},a.capability);
+    if(!current(a))return;
+    const call=callSnapshot(a,confirmed);
+    if(!['connecting','active'].includes(call.state)||!grantIsValid(confirmed.rtc)||confirmed.rtc.channel!==a.channel){
+      const detail=endedDetail(call.reason);finish(a,...detail);return;
+    }
+    a.callState=call.state;
+    const mic=a.mic;if(!mic||mic.getMediaStreamTrack().readyState!=='live')throw Error('microphone_ended');
+    await client.publish(mic);
+    if(!current(a)){try{await client.unpublish(mic);}catch(_){}return;}
+    a.published=true;renderCall(a);
+    for(const user of client.remoteUsers){if(user.hasAudio)subscribeRobot(a,user,'audio');}
+  }catch(_){if(current(a))finish(a,'Error','Could not connect the private call. Please try again.');}
+  finally{a.connecting=false;}
+}
+async function pollCall(a){
+  clearTimeout(a.pollTimer);
+  if(!current(a)||!a.callId)return;
+  try{
+    const value=await api('/calls/poll',{call_id:a.callId},a.capability);
+    if(!current(a))return;
+    const call=callSnapshot(a,value);a.callState=call.state;
+    if(terminalStates.has(call.state)){const detail=endedDetail(call.reason);finish(a,...detail);return;}
+    if(value.rtc&&(!['connecting','active'].includes(call.state)||!grantIsValid(value.rtc)))throw Error('invalid_grant');
+    if(value.rtc&&a.channel&&value.rtc.channel!==a.channel)throw Error('changed_grant');
+    renderCall(a);
+    // Joining must not block the one-second caller lease polls.
+    if(value.rtc&&!a.connecting&&!a.joined)connectPrivate(a,value.rtc).catch(()=>{if(current(a))finish(a,'Error','The private call grant was invalid.');});
+  }catch(_){if(current(a))finish(a,'Error','The call service connection was lost. Your microphone is off.');}
+  finally{if(current(a))a.pollTimer=setTimeout(()=>pollCall(a),1000);}
+}
+async function startCall({name,password,deviceId}){
+  if(attempt||!pageOpen)return;
+  if(!/^[A-Za-z][A-Za-z '\-]{0,31}$/.test(name)){
+    $('password').value='';UI.setState('error',errorText({code:'invalid_name'}));return;
+  }
+  const a={requestId:randomId(),closed:false,remoteTracks:new Set(),muted:false,muteBusy:false,published:false,joined:false,connecting:false,callState:null};
+  attempt=a;UI.setMuted(false);UI.setState('calling');
+  $('password').value='';
+
+  try{
+    if(cleanup)await cleanup;
+    if(!current(a))return;
+    if(!accessValid()){
+      if(typeof password!=='string'||!password.length)throw Object.assign(Error(),{code:'password_required'});
+      if(password.length>128||new TextEncoder().encode(password).length>256)throw Object.assign(Error(),{code:'password_invalid'});
+      const response=await fetch('/auth/config',{cache:'no-store',signal:AbortSignal.timeout(5000)});
+      const config=await response.json();
+      if(!current(a))return;
+      if(!response.ok||!config.required||config.mode!=='password')throw Object.assign(Error(),{code:'invalid_configuration'});
+      const pending=api('/auth/session',{password});password='';
+      const session=await pending;
+      if(!current(a))return;
+      if(typeof session.access_token!=='string'||!/^[A-Za-z0-9_-]{32,256}$/.test(session.access_token)||
+        !Number.isInteger(session.expires_at)||session.expires_at<=Date.now()/1000)throw Object.assign(Error(),{code:'invalid_session'});
+      callerSession=session.access_token;accessExpires=session.expires_at;
+      clearTimeout(accessTimer);accessTimer=setTimeout(clearAccess,Math.max(0,accessExpires*1000-Date.now()));syncAccess();
+    }
+    password='';
+    const response=await fetch('/status',{headers:{Authorization:'Bearer '+callerSession},cache:'no-store',signal:AbortSignal.timeout(3000)});
+    const status=await response.json();
+    if(!current(a))return;
+    if(!response.ok)throw Object.assign(Error(),{code:status.error});
+    if(typeof status.device_online!=='boolean'||typeof status.busy!=='boolean')throw Error('invalid_status');
+    if(!status.device_online||status.busy)throw Object.assign(Error(),{code:status.busy?'device_busy':'device_offline'});
+    $('statusText').textContent='Allow microphone access if asked. No sound is being sent yet.';
+    const config={encoderConfig},device=deviceId;if(device)config.microphoneId=device;
+    const track=await AgoraRTC.createMicrophoneAudioTrack(config);
+    if(!current(a)){releaseTrack(track);return;}
+    a.mic=track;
+    if(track.getMediaStreamTrack().readyState!=='live')throw Error('microphone_not_live');
+    a.micOpened=performance.now();
+    listMics();
+    $('statusText').textContent='Contacting StackChan. Your microphone is local only.';
+    // Quiet input is only a hint: callers may wait until the call is answered.
+    if(!accessValid())throw Object.assign(Error('session_expired'),{code:'session_expired'});
+    const value=await api('/calls',{request_id:a.requestId,caller_name:name},callerSession);
+    if(!value||typeof value.call_id!=='string'||!/^[a-f0-9]{32}$/.test(value.call_id)||
+       typeof value.access_token!=='string'||!value.access_token||value.access_token.length>512)throw Error('invalid_call_response');
+    a.callId=value.call_id;a.capability=value.access_token;
+    if(!current(a)){endRemote(a,!pageOpen);return;}
+    const call=callSnapshot(a,value);
+    if(value.rtc!==null)throw Error('unexpected_initial_grant');
+    a.callState=call.state;
+    if(terminalStates.has(call.state)){const detail=endedDetail(call.reason);finish(a,...detail);return;}
+    renderCall(a);pollCall(a);
+  }catch(error){
+    if(!current(a))return;
+    if(['session_required','session_expired','password_invalid'].includes(error.code))clearAccess();
+    finish(a,'Error',errorText(error));
+  }finally{password='';}
+}
+async function endCall(){
+  if(attempt)await finish(attempt,'Ended','You hung up. Your microphone is off.');
+  else UI.setState('ended');
+}
+async function setMuted(m){
+  const a=attempt;if(!a||!a.published||!a.mic||a.muteBusy)return;
+  const track=a.mic;a.muteBusy=true;renderCall(a);
+  try{await track.setMuted(m);if(current(a)&&a.mic===track){a.muted=m;UI.setMuted(m);renderCall(a);}}
+  catch(_){if(current(a))finish(a,'Error','Microphone control failed. Your microphone is off.');}
+  finally{a.muteBusy=false;if(current(a))renderCall(a);}
+}
+AgoraRTC.onAutoplayFailed=()=>{
+  const a=attempt;if(!a?.remoteTrack||!current(a))return;
+  a.playbackBlocked=true;$('resume-playback').hidden=false;renderCall(a);
+};
+$('resume-playback').onclick=()=>{
+  const a=attempt;if(!a?.remoteTrack||!current(a))return;
+  a.playbackBlocked=false;$('resume-playback').hidden=true;
+  try{AgoraRTC.resumeAudioContext();a.remoteTrack.play();}catch(_){a.playbackBlocked=true;$('resume-playback').hidden=false;}
+  renderCall(a);
+};
+function volume(track){
+  try{const value=track?.getVolumeLevel()||0;return Number.isFinite(value)?Math.max(0,Math.min(1,value)):0;}catch(_){return 0;}
+}
+setInterval(()=>{
+  const a=attempt;
+  if(a?.mic&&a.mic.getMediaStreamTrack().readyState!=='live'){
+    finish(a,'Error','The selected microphone disconnected. Your microphone is off.');return;
+  }
+  UI.setLocalLevel(a&&!a.muted?volume(a.mic):0);
+  UI.setRemoteLevel(volume(a?.remoteTrack));
+},100);
+window.addEventListener('pagehide',()=>{
+  pageOpen=false;$('password').value='';clearAccess();
+  if(attempt)finish(attempt,'Ended','Page closed.',true);
+});
+window.addEventListener('pageshow',event=>{if(event.persisted){pageOpen=true;syncAccess();UI.setState('idle');}});
+
+$('callForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (UI.state === 'calling' || UI.state === 'connected') return endCall();
+  if (!accessValid() && !$('password').value) { $('password').focus(); UI.setState('error', 'Enter the call password'); return; }
+  try { await startCall({ name: $('name').value.trim(), password: $('password').value, deviceId: $('mic').value }); }
+  catch (err) { UI.setState('error', err?.message || 'Couldn’t connect'); }
+});
+$('muteBtn').addEventListener('click', () => setMuted(!UI.muted));
+UI.setState('idle');
+</script>
+</body>
+</html>

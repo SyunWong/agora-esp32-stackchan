@@ -1,0 +1,346 @@
+diff --git a/solutions/agora_demo/main/CMakeLists.txt b/solutions/agora_demo/main/CMakeLists.txt
+--- a/solutions/agora_demo/main/CMakeLists.txt
++++ b/solutions/agora_demo/main/CMakeLists.txt
+@@ -6,7 +6,7 @@
+ 
+ set(stackchan_display_sources "")
+ if(CONFIG_STACKCHAN_STATUS_SCREEN)
+-    list(APPEND stackchan_display_sources "status_screen.c")
++    list(APPEND stackchan_display_sources "status_screen.c" "stackchan_battery.c")
+ endif()
+ if(CONFIG_STACKCHAN_INTERACTIVE_AI)
+     list(APPEND stackchan_display_sources "stackchan_touch.c" "stackchan_interaction.c" "task_diagnostics.c" "stackchan_afe.c")
+@@ -33,6 +33,7 @@
+     REQUIRES
+         ${stackchan_motion_requires}
+         esp_lcd
++        esp_driver_i2c
+         espressif__esp_lcd_ili9341
+         espressif__esp_lcd_touch
+         av_render
+diff --git a/solutions/agora_demo/main/stackchan_human.c b/solutions/agora_demo/main/stackchan_human.c
+--- a/solutions/agora_demo/main/stackchan_human.c
++++ b/solutions/agora_demo/main/stackchan_human.c
+@@ -174,6 +174,15 @@
+         stackchan_motion_request(STACKCHAN_MOTION_REST);
+     }
+ #endif
++#ifdef CONFIG_STACKCHAN_STATUS_SCREEN
++    // Before network/media sessions: show charge level even without Wi-Fi.
++    uint32_t battery_start = (uint32_t)(esp_timer_get_time() / 1000);
++    stackchan_status_battery_start(battery_start);
++    do {
++        vTaskDelay(pdMS_TO_TICKS(25));
++        TICK_STATUS();
++    } while ((uint32_t)(esp_timer_get_time() / 1000) - battery_start < 2100U);
++#endif
+     bool cloud_control = false;
+ #ifdef CONFIG_STACKCHAN_INTERACTIVE_AI
+     cloud_control = strncmp(STACKCHAN_CONTROL_URL, "https://", 8) == 0;
+diff --git a/solutions/agora_demo/main/status_screen.c b/solutions/agora_demo/main/status_screen.c
+--- a/solutions/agora_demo/main/status_screen.c
++++ b/solutions/agora_demo/main/status_screen.c
+@@ -55,6 +55,8 @@
+  */
+ #include "sdkconfig.h"
+ #include "status_screen.h"
++#include "stackchan_battery.h"
++#include <stdio.h>
+ 
+ #if CONFIG_STACKCHAN_STATUS_SCREEN
+ #include <stdbool.h>
+@@ -95,6 +97,9 @@
+ static bool blink_started;
+ static uint32_t next_blink_ms;
+ static char previous_label[LABEL_MAX + 1];
++static bool battery_visible;
++static uint32_t battery_until;
++static char deferred_label[LABEL_MAX + 1];
+ 
+ _Static_assert(EYE_SIZE * EYE_SIZE <= WIDTH * STRIP_LINES, "Eye must fit DMA strip");
+ 
+@@ -169,8 +174,20 @@
+     int gx = (x - left) / scale;
+     int col = gx % 6;
+     unsigned char ch = (unsigned char)text[gx / 6];
+-    if (col >= 5 || ch < 'A' || ch > 'Z') return false;
+-    return (font[ch - 'A'][(y - top) / scale] & (1 << (4 - col))) != 0;
++    static const uint8_t digits[10][7] = {
++        {14,17,19,21,25,17,14}, {4,12,4,4,4,4,14}, {14,17,1,2,4,8,31},
++        {30,1,1,14,1,1,30}, {2,6,10,18,31,2,2}, {31,16,16,30,1,1,30},
++        {14,16,16,30,17,17,14}, {31,1,2,4,8,8,8}, {14,17,17,14,17,17,14},
++        {14,17,17,15,1,1,14},
++    };
++    static const uint8_t pct[7] = {25,26,2,4,8,11,19};
++    static const uint8_t approx[7] = {0,0,9,22,0,0,0};
++    static const uint8_t dash[7] = {0,0,0,14,0,0,0};
++    if (col >= 5) return false;
++    const uint8_t *glyph = ch >= 'A' && ch <= 'Z' ? font[ch-'A'] :
++                           ch >= '0' && ch <= '9' ? digits[ch-'0'] :
++                           ch == '%' ? pct : ch == '~' ? approx : ch == '-' ? dash : NULL;
++    return glyph && (glyph[(y - top) / scale] & (1 << (4 - col))) != 0;
+ }
+ 
+ static uint16_t wire_color(uint16_t rgb565)
+@@ -226,6 +243,12 @@
+ void stackchan_status_show(const char *label)
+ {
+     if (!ready || label == NULL) return;
++    // Calls/network may change their label while a transient battery card is up.
++    // Remember the newest label; never paint a face band over the card.
++    if (battery_visible) {
++        snprintf(deferred_label, sizeof(deferred_label), "%s", label);
++        return;
++    }
+     const char *visible = (strcmp(label, "READY") == 0 || strcmp(label, "RTC READY") == 0) ? "" : label;
+     char current[LABEL_MAX + 1];
+     size_t n = strnlen(visible, LABEL_MAX);
+@@ -256,9 +279,61 @@
+     ESP_LOGI(TAG, "State: %s", label);
+ }
+ 
++static void show_battery(stackchan_battery_notice_t notice, uint32_t now_ms)
++{
++    stackchan_battery_reading_t value = stackchan_battery_reading();
++    char percent[12];
++    if (value.valid) snprintf(percent, sizeof(percent), "~%d%%", value.percent);
++    else snprintf(percent, sizeof(percent), "--");
++    const char *detail = !value.valid ? "UNAVAILABLE" :
++                         notice == BATTERY_NOTICE_LOW ? "PLEASE CHARGE" :
++                         value.milliamps < -20 ? "CHARGING" : "BATTERY";
++    uint16_t ink = notice == BATTERY_NOTICE_LOW ? 0xfd20 : 0xffff;
++    if (!battery_visible) snprintf(deferred_label, sizeof(deferred_label), "%s", previous_label);
++    battery_visible = true;
++    battery_until = now_ms + 2000;
++    for (int top = 0; top < HEIGHT; top += STRIP_LINES) {
++        for (int row = 0; row < STRIP_LINES; ++row) {
++            int y = top + row;
++            for (int x = 0; x < WIDTH; ++x) {
++                bool outline = x >= 120 && x < 196 && y >= 65 && y < 101 &&
++                               (x < 123 || x >= 193 || y < 68 || y >= 98);
++                bool terminal = x >= 196 && x < 201 && y >= 77 && y < 89;
++                bool fill = value.valid && x >= 127 && x < 127 + value.percent * 62 / 100 && y >= 72 && y < 94;
++                uint16_t color = outline || terminal || fill ? ink : 0;
++                if (text_pixel(percent, 120, 4, x, y)) color = ink;
++                if (text_pixel(value.valid ? "ESTIMATE" : "UNKNOWN", 160, 1, x, y)) color = 0x8c71;
++                if (text_pixel(detail, 190, 2, x, y)) color = ink;
++                strip[row * WIDTH + x] = wire_color(color);
++            }
++        }
++        if (!submit_pixels(0, top, WIDTH, STRIP_LINES)) return;
++    }
++    ESP_LOGI(TAG, "Battery card kind=%d valid=%d estimate=%d duration_ms=2000",
++             notice, value.valid, value.valid ? value.percent : -1);
++}
++
++void stackchan_status_battery_start(uint32_t now_ms)
++{
++    if (!ready) return;
++    stackchan_battery_init(now_ms);
++    stackchan_status_tick(now_ms);
++}
++
+ void stackchan_status_tick(uint32_t now_ms)
+ {
+     if (!ready || !scene_drawn) return;
++    stackchan_battery_notice_t notice = stackchan_battery_tick(now_ms);
++    if (notice != BATTERY_NOTICE_NONE) show_battery(notice, now_ms);
++    if (!ready) return;
++    if (battery_visible) {
++        if ((int32_t)(now_ms - battery_until) < 0) return;
++        battery_visible = false; scene_drawn = false; eyes_closed = false;
++        blink_started = false;
++        stackchan_status_show(deferred_label);
++        ESP_LOGI(TAG, "Battery card hidden; face restored");
++        if (!ready) return;
++    }
+     if (!blink_started) {
+         blink_started = true;
+         next_blink_ms = now_ms + 5200;
+diff --git a/solutions/agora_demo/main/status_screen.h b/solutions/agora_demo/main/status_screen.h
+--- a/solutions/agora_demo/main/status_screen.h
++++ b/solutions/agora_demo/main/status_screen.h
+@@ -18,6 +18,9 @@
+ // Call from the same task about every 100 ms. Each blink transition submits
+ // exactly two 20x20 eye rectangles; no additional framebuffer or task.
+ void stackchan_status_tick(uint32_t now_ms);
++// Start a two-second battery card after power/motion setup, before Wi-Fi.
++// Tick restores the latest face/status automatically; no persistent overlay.
++void stackchan_status_battery_start(uint32_t now_ms);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/solutions/agora_demo/main/stackchan_battery.c b/solutions/agora_demo/main/stackchan_battery.c
+new file mode 100644
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_battery.c
+@@ -0,0 +1,147 @@
++/* StackChan base battery monitor, register facts from M5Stack StackChan-BSP
++ * and M5Unified INA226/AXP2101 drivers (MIT). Original implementation here.
++ * INA226 0x41: 1.25mV/bus LSB, 2.5uV/shunt LSB, 10 milliohm resistor.
++ * Positive current = discharging. AXP2101 0x49 bit2 = long power-key event;
++ * acknowledge only that W1C bit, never other interrupts or power settings.
++ */
++#include "stackchan_battery.h"
++#include "driver/i2c_master.h"
++#include "esp_board_manager.h"
++#include "esp_log.h"
++#include <stddef.h>
++
++#define IO_MS 10
++#define SAMPLE_MS 5000U
++#define KEY_MS 250U
++#define REMIND_MS 300000U
++static const char *TAG = "STACKCHAN_BATTERY";
++static i2c_master_dev_handle_t monitor, pmic;
++static bool attempted, startup_pending, low_latched, reminded, key_armed;
++static uint32_t last_sample, last_key, last_reminder;
++static unsigned low_samples, recovered_samples;
++static stackchan_battery_reading_t reading;
++
++static bool read_bytes(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, size_t size)
++{
++    return dev && i2c_master_transmit_receive(dev, &reg, 1, data, size, IO_MS) == ESP_OK;
++}
++static bool read16(uint8_t reg, uint16_t *value)
++{
++    uint8_t data[2];
++    if (!read_bytes(monitor, reg, data, sizeof(data))) return false;
++    *value = (uint16_t)data[0] << 8 | data[1];
++    return true;
++}
++static bool ack_long_key(void)
++{
++    const uint8_t bytes[] = {0x49, 0x04};
++    return i2c_master_transmit(pmic, bytes, sizeof(bytes), IO_MS) == ESP_OK;
++}
++static int estimate(int mv)
++{
++    // Coarse single-cell voltage estimate. Loaded/charging voltage is not SOC.
++    static const int volts[] = {3300, 3500, 3600, 3700, 3750, 3800, 3850, 3900, 4000, 4100, 4200};
++    static const int levels[] = {0, 5, 10, 20, 30, 40, 50, 60, 75, 90, 100};
++    if (mv <= volts[0]) return 0;
++    for (unsigned i = 1; i < sizeof(volts)/sizeof(volts[0]); ++i) {
++        if (mv <= volts[i]) {
++            int p = levels[i-1] + (mv-volts[i-1])*(levels[i]-levels[i-1])/(volts[i]-volts[i-1]);
++            return ((p+2)/5)*5;
++        }
++    }
++    return 100;
++}
++static void sample(void)
++{
++    uint16_t bus, shunt, config;
++    reading.valid = read16(0x00, &config) && (config & 7) == 7 &&
++                    read16(0x02, &bus) && read16(0x01, &shunt);
++    if (reading.valid) {
++        int mv = (int)bus * 5 / 4;
++        int ma = (int)(int16_t)shunt / 4;
++        reading.valid = mv >= 2500 && mv <= 4400 && ma > -8000 && ma < 8000;
++        if (reading.valid) {
++            reading.millivolts = mv;
++            reading.milliamps = ma;
++            reading.percent = estimate(mv);
++        }
++    }
++    if (!reading.valid) {
++        reading.millivolts = 0; reading.milliamps = 0; reading.percent = -1;
++        low_samples = recovered_samples = 0;
++        return;
++    }
++    // Three samples reject a brief servo/speaker voltage sag; charging suppresses warnings.
++    if (reading.millivolts <= 3500 && reading.milliamps >= -20) {
++        recovered_samples = 0;
++        if (low_samples < 3) ++low_samples;
++        if (low_samples == 3) low_latched = true;
++    } else {
++        low_samples = 0;
++        if (reading.millivolts >= 3650 || reading.milliamps < -20) {
++            if (recovered_samples < 3) ++recovered_samples;
++            if (recovered_samples == 3) { low_latched = false; reminded = false; }
++        } else recovered_samples = 0;
++    }
++}
++void stackchan_battery_init(uint32_t now_ms)
++{
++    if (attempted) return;
++    attempted = true; startup_pending = true;
++    last_sample = last_key = now_ms;
++    i2c_master_bus_handle_t bus = NULL;
++    if (esp_board_manager_get_periph_handle("i2c_master", (void **)&bus) != ESP_OK || !bus) return;
++    i2c_device_config_t config = {.dev_addr_length=I2C_ADDR_BIT_LEN_7,
++                                .device_address=0x41, .scl_speed_hz=400000};
++    if (i2c_master_bus_add_device(bus, &config, &monitor) == ESP_OK) {
++        uint16_t id, manufacturer;
++        if (!read16(0xff, &id) || id != 0x2260 || !read16(0xfe, &manufacturer) || manufacturer != 0x5449) {
++            i2c_master_bus_rm_device(monitor); monitor = NULL;
++        }
++    }
++    config.device_address = 0x34;
++    if (i2c_master_bus_add_device(bus, &config, &pmic) == ESP_OK) {
++        uint8_t id, flags;
++        if (!read_bytes(pmic, 0x03, &id, 1) || id != 0x4a ||
++            !read_bytes(pmic, 0x49, &flags, 1)) {
++            i2c_master_bus_rm_device(pmic); pmic = NULL;
++        } else {
++            // Discard a stale startup long-press rather than displaying shutdown.
++            key_armed = !(flags & 4) || ack_long_key();
++        }
++    }
++    sample();
++    ESP_LOGI(TAG, "Monitor=%d key=%d valid=%d battery_mv=%d current_ma=%d estimate=%d",
++             monitor != NULL, pmic != NULL, reading.valid, reading.millivolts,
++             reading.milliamps, reading.percent);
++}
++stackchan_battery_reading_t stackchan_battery_reading(void) { return reading; }
++stackchan_battery_notice_t stackchan_battery_tick(uint32_t now_ms)
++{
++    if (!attempted) return BATTERY_NOTICE_NONE;
++    if (startup_pending) { startup_pending = false; return BATTERY_NOTICE_STARTUP; }
++    if ((uint32_t)(now_ms-last_sample) >= SAMPLE_MS) { last_sample = now_ms; sample(); }
++    if (pmic && (uint32_t)(now_ms-last_key) >= KEY_MS) {
++        last_key = now_ms;
++        uint8_t flags;
++        if (read_bytes(pmic, 0x49, &flags, 1)) {
++            bool was_armed = key_armed;
++            if (!(flags & 4)) key_armed = true;
++            else {
++                key_armed = ack_long_key();
++                if (was_armed && key_armed) {
++                    sample(); last_sample = now_ms;
++                    ESP_LOGI(TAG, "Power-key battery preview; hardware power-off unchanged");
++                    return BATTERY_NOTICE_POWER_KEY;
++                }
++            }
++        }
++    }
++    if (reading.valid && low_latched && reading.milliamps >= -20 &&
++        (!reminded || (uint32_t)(now_ms-last_reminder) >= REMIND_MS)) {
++        reminded = true; last_reminder = now_ms;
++        ESP_LOGW(TAG, "Low battery reminder battery_mv=%d estimate=%d", reading.millivolts, reading.percent);
++        return BATTERY_NOTICE_LOW;
++    }
++    return BATTERY_NOTICE_NONE;
++}
+diff --git a/solutions/agora_demo/main/stackchan_battery.h b/solutions/agora_demo/main/stackchan_battery.h
+new file mode 100644
+--- /dev/null
++++ b/solutions/agora_demo/main/stackchan_battery.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include <stdbool.h>
++#include <stdint.h>
++
++// Same application task as status_screen. Uses BoardManager's existing I2C bus.
++// No task, GPIO, power rail, charger, protection or automatic shutdown changes.
++typedef struct {
++    bool valid;
++    int millivolts;
++    int milliamps;
++    int percent; // Voltage estimate, rounded to 5%; not a fuel-gauge measurement.
++} stackchan_battery_reading_t;
++typedef enum { BATTERY_NOTICE_NONE, BATTERY_NOTICE_STARTUP,
++               BATTERY_NOTICE_LOW, BATTERY_NOTICE_POWER_KEY } stackchan_battery_notice_t;
++void stackchan_battery_init(uint32_t now_ms);
++stackchan_battery_notice_t stackchan_battery_tick(uint32_t now_ms);
++stackchan_battery_reading_t stackchan_battery_reading(void);

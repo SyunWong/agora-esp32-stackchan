@@ -1,0 +1,182 @@
+{
+  "status": "developer-preview",
+  "upstream_commit": "dc3ab928137916d7b214a9a8ffe52e0e81794471",
+  "files": {
+    ".gitignore": {
+      "bytes": 95,
+      "sha256": "b1b023ec58cb386cc2d3d8b202174752555e589fe721ab5cc97e0a5ab0872d01"
+    },
+    ".recipe-root": {
+      "bytes": 28,
+      "sha256": "5d111fc8b2ed652b3d999db0d0bca980e6cd687144870c0692cdf0f985c3f9c3"
+    },
+    "NOTICE.md": {
+      "bytes": 873,
+      "sha256": "f3ffc2820a4580ecfa632847cfda01a8f1873890455d5806f629d3ca17487b4d"
+    },
+    "README.md": {
+      "bytes": 2914,
+      "sha256": "48133b5c1967d4c9c32498719be67bb377f672b4f92e5568d6dd25a3c91fe3a4"
+    },
+    "cloud/api.py": {
+      "bytes": 5635,
+      "sha256": "dcadd20e82761e85690a3806fd2c01e90592b58978d1009e9e4bb66ba101e4de"
+    },
+    "cloud/caller_sessions.py": {
+      "bytes": 10138,
+      "sha256": "2f20a659c5bdb99a6d6a589b1eaf1f088ba0e1090c34ef9a1798ae0f668e27f6"
+    },
+    "cloud/provider.py": {
+      "bytes": 11551,
+      "sha256": "8a67b186febb57d4d419eaf16d899f45e72d5b7c97664cfcbb7bc7a33b104e42"
+    },
+    "cloud/state.py": {
+      "bytes": 5194,
+      "sha256": "d8eed68686920829db1edfe43489ab1c20be9c7cda129df823b5318a15e4bfee"
+    },
+    "cloud/tests/test_api.py": {
+      "bytes": 17918,
+      "sha256": "730a34258f7989a7851c25c4fc10871a6734d84ec88ea032c5b8ef9f4d466a71"
+    },
+    "cloud/tests/test_caller_sessions.py": {
+      "bytes": 18404,
+      "sha256": "dbc7f735e9dc69a015b3544300d3c0b97e485af262b43201c82218a59bc32b57"
+    },
+    "cloud/tests/test_password_auth.py": {
+      "bytes": 13338,
+      "sha256": "2b8d61268de2263d43816179e4efc287787584a96d9395125e1e442b149642f8"
+    },
+    "cloud/tests/test_state.py": {
+      "bytes": 18857,
+      "sha256": "b9ba0fe9b9aaf96d336e4f1c53f8418d09c50e7fce8c7f42e10fd735d4ce8b27"
+    },
+    "cloud/tests/test_worker.py": {
+      "bytes": 11525,
+      "sha256": "facc750dd18746fa2b90be52db9bb5eef567e0d5005facebaa0332cd025bd2e3"
+    },
+    "cloud/token_helper.py": {
+      "bytes": 2026,
+      "sha256": "4827e4b38bea91e70ded13e803fa7fa86808a6cc7801b52201680cc6fa7d329c"
+    },
+    "cloud/worker.py": {
+      "bytes": 7163,
+      "sha256": "1da66ed42c87e0cc4876a19f665f3eb0a4d746d33f2554e6d273873e96c13a72"
+    },
+    "docs/ARCHITECTURE.md": {
+      "bytes": 4088,
+      "sha256": "7a939699eef6797d64afb8811cdb8b214ddea13aebc8dd4239a35c0b2cae3692"
+    },
+    "docs/BLOG-BRIEF.md": {
+      "bytes": 1261,
+      "sha256": "bb98bc6e0e76415962388d580e4a47dddfcd4fc01f5694e58c070b67617aa444"
+    },
+    "docs/GETTING-STARTED.md": {
+      "bytes": 10875,
+      "sha256": "0957492e9c72ef3596399ed6bf222200ed10ff099bf99f5d43859c65064a0209"
+    },
+    "docs/RELEASE-CHECKLIST.md": {
+      "bytes": 2762,
+      "sha256": "64600bf9f03816ddd737dc2bb7aa9d3ed2b05c21b7097d085c2993137ab82f04"
+    },
+    "docs/TRY-IT.md": {
+      "bytes": 2796,
+      "sha256": "d8de2b3153332b4c646e045b450168df803f8e7d5bfdec13d209be2ba8a85b70"
+    },
+    "firmware/dependencies.lock": {
+      "bytes": 22031,
+      "sha256": "59caa66926797a4e037864856d838cd0f1be562caf645c4b2010f324df9d7c46"
+    },
+    "firmware/stackchan-battery.patch": {
+      "bytes": 14940,
+      "sha256": "b72a428b05711eaf2dbf1a3df82c6ad8e05ba2e0487e223302d972bb381aa80a"
+    },
+    "firmware/stackchan-media.patch": {
+      "bytes": 175797,
+      "sha256": "c86b7cdc8d21e5829cab74ca1413b3f6a1ce613504a0e51af1691ee978e16bdf"
+    },
+    "service/DEPENDENCIES.md": {
+      "bytes": 887,
+      "sha256": "2855206e87c2b8a691c05e670662c1b8e89d9aff45ab2a89143af3c6a317f9b2"
+    },
+    "service/agent_profile.py": {
+      "bytes": 587,
+      "sha256": "177a09b2edc8d852fdd06b8e22bc4c1c214e52fe160e8cec17c83a6d6066bb75"
+    },
+    "service/agora_token/AccessToken2.py": {
+      "bytes": 16131,
+      "sha256": "f0a6397c9d62ff0bdf78c421395677ca22a154b3e0e3712c6b0e3a65f2cef0bc"
+    },
+    "service/agora_token/LICENSE": {
+      "bytes": 1073,
+      "sha256": "cbf344f2f837a918ef6864ceedf7e6e4c193070f27ef8497390d6c07a6d5558a"
+    },
+    "service/agora_token/Packer.py": {
+      "bytes": 2704,
+      "sha256": "f89490eff641d5e1b2e698f66e6c8117c12fa8fb5c3b6eb49c48d35d1d436ca2"
+    },
+    "service/agora_token/RtcTokenBuilder2.py": {
+      "bytes": 18499,
+      "sha256": "6977bcffe57be58bce215dbb4c3bd1606abd5774f202f986a853b524fe7e0969"
+    },
+    "service/agora_token/__init__.py": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "service/caller_auth.py": {
+      "bytes": 5316,
+      "sha256": "837ee2042ad5e568f6781f6261957c40e8ff22dfff0f48841413d205e9284c6c"
+    },
+    "service/stackchan_ai.py": {
+      "bytes": 22590,
+      "sha256": "6ebcb6d4312fe1491c1ff6cc43cb197ceb85796e49ab2a20fad1f0d7e9d527c6"
+    },
+    "service/stackchan_calls.py": {
+      "bytes": 33206,
+      "sha256": "36ee00333e184a57ffe9272eea7e34bd793ae55aeb2e7a33a1dfd67c5949e23b"
+    },
+    "service/web/index.html": {
+      "bytes": 34732,
+      "sha256": "88306ba73f1fcebf21d1c50923dc5586a70659d8aa17d680af5b125962840eab"
+    },
+    "service/web/lines.png": {
+      "bytes": 56305,
+      "sha256": "bfe08f41255fc40ebada37bed3b6727209bd7a492aea51f41c049787f4c97003"
+    },
+    "service/web/stackchan.png": {
+      "bytes": 1924461,
+      "sha256": "f305c611020da47c8ab6c15987a63837658f1ba818f7edcbef172b7d283368f0"
+    },
+    "tools/bundle_cloud.py": {
+      "bytes": 1937,
+      "sha256": "4fab8a939e3fc083403a4765e64cf6840efed75799d1bbe78d9c6935c6974c0b"
+    },
+    "tools/check_package.py": {
+      "bytes": 3038,
+      "sha256": "3099093b2883c22bd7f8bf2bc156fbf8111f99e5568b8f9fd9750125ef1ea160"
+    },
+    "tools/check_release_tools.py": {
+      "bytes": 6768,
+      "sha256": "f800c32b2e091d0356323257fbe084c98111095fcf18e609be23aceaede54213"
+    },
+    "tools/check_setup.py": {
+      "bytes": 2989,
+      "sha256": "2bed266c3b536ae5c5c628507391c00482510d12dceaec26ee87179a85494385"
+    },
+    "tools/configure.py": {
+      "bytes": 5656,
+      "sha256": "485eb7203a03c0fe22e6364852eb5eea307858f4e8c591d405215c2dca4cbf4d"
+    },
+    "tools/deploy_cloud.py": {
+      "bytes": 7453,
+      "sha256": "6aab2a114237503d37c298da73bb05384b6e578ac8f24c5ceec439a7c89b6e16"
+    },
+    "tools/fetch_web_sdk.py": {
+      "bytes": 1565,
+      "sha256": "60e0b0f0e4a71b676338405dadc770ca370f93f65c64fcd3b8f1cb9926bb1f82"
+    },
+    "tools/install_interactive.py": {
+      "bytes": 11554,
+      "sha256": "bb6b838678a1b096de847711622fe9c903b9ac3e3b5ee2e4562e720a559eb75b"
+    }
+  }
+}

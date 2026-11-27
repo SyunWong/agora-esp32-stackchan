@@ -21,6 +21,50 @@ this a fully reproducible tutorial. See [release checks](docs/RELEASE-CHECKLIST.
 - Separate AI and human channels, with no AI agent in the human call.
 - A cloud control service; no always-on laptop backend during normal use.
 
+## Architecture at a glance
+
+ESP32 brings the conversation to a physical device. Agora connects its audio to
+an AI agent or a remote person, while a small cloud service coordinates sessions.
+
+```mermaid
+flowchart LR
+    Robot["StackChan / ESP32-S3"]
+    Browser["Browser caller"]
+    RTC["Agora real-time audio"]
+    AI["Agora Conversational AI"]
+    Models["Speech recognition · LLM · TTS"]
+    Control["Cloudflare Worker + Durable Object"]
+
+    Robot <-->|Audio| RTC
+    Browser <-->|Human-call audio| RTC
+    RTC <-->|AI-session audio| AI
+    AI <--> Models
+    Robot -.->|HTTPS control| Control
+    Browser -.->|Login and call state| Control
+    Control -.->|Start and stop agent| AI
+```
+
+Solid lines carry audio or AI processing; dotted lines coordinate sessions.
+The diagram shows two separate modes, not one shared conversation:
+
+- **Talk to AI:** tap StackChan to start a conversation. Agora Conversational AI
+  connects speech recognition, the language model and text-to-speech in the cloud.
+- **Call a person:** the browser calls StackChan through a separate Agora RTC
+  channel. After acceptance, the browser publishes its microphone. No AI agent
+  joins the human call.
+
+| Component | What it handles |
+| --- | --- |
+| **ESP32-S3 + Espressif WebRTC components** | Microphone capture, speaker playback, touch input and the robot's face |
+| **Agora** | Real-time audio transport and conversational AI sessions |
+| **Cloudflare Worker + Durable Object** | Password login, temporary media credentials, agent lifecycle and call state |
+| **Browser caller** | The calling interface, microphone selection, mute and audio levels |
+
+Audio travels directly through Agora; it does not pass through the Worker or an
+always-on laptop server. The App Certificate and provider keys stay server-side.
+For call transitions, credential boundaries and source-file pointers, see the
+[full architecture guide](docs/ARCHITECTURE.md).
+
 Start with [the build guide](docs/GETTING-STARTED.md), then follow
 [the two demo milestones](docs/TRY-IT.md). Read [the architecture](docs/ARCHITECTURE.md)
 when you want to change the personality, voice or caller experience.

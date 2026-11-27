@@ -15,8 +15,8 @@
       "sha256": "f3ffc2820a4580ecfa632847cfda01a8f1873890455d5806f629d3ca17487b4d"
     },
     "README.md": {
-      "bytes": 2914,
-      "sha256": "48133b5c1967d4c9c32498719be67bb377f672b4f92e5568d6dd25a3c91fe3a4"
+      "bytes": 4841,
+      "sha256": "6af8f7abd97f4f88d1a1cf24197de3b29e3b3d055da37faaf8d892ec0e70b5c8"
     },
     "cloud/api.py": {
       "bytes": 5635,
